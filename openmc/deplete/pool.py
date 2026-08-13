@@ -19,6 +19,30 @@ USE_MULTIPROCESSING = True
 # calculations
 NUM_PROCESSES = None
 
+
+_DEPLETION_FUNC = None
+_DEPLETION_CHAIN = None
+_DEPLETION_MATRIX_FUNC = None
+def _initialize_depletion_worker(func, chain, matrix_func):
+    global _DEPLETION_FUNC
+    global _DEPLETION_CHAIN
+    global _DEPLETION_MATRIX_FUNC
+    _DEPLETION_FUNC = func
+    _DEPLETION_CHAIN = chain
+    _DEPLETION_MATRIX_FUNC = matrix_func
+def _form_matrix_and_deplete(rate, fission_yields, number, dt, matrix_args):
+    if _DEPLETION_MATRIX_FUNC is None:
+        matrix = _DEPLETION_CHAIN.form_matrix(rate, fission_yields)
+    else:
+        matrix = _DEPLETION_MATRIX_FUNC(
+            _DEPLETION_CHAIN,
+            rate,
+            fission_yields,
+            *matrix_args,
+        )
+    return _DEPLETION_FUNC(matrix, number, dt)
+
+
 def _distribute(items):
     """Distribute items across MPI communicator
 
@@ -118,6 +142,35 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
             "Number of material fission yield distributions {} is not "
             "equal to the number of compositions {}".format(
                 len(fission_yields), len(n)))
+
+    # In the common case with no transfer or external source terms, form each
+    # depletion matrix in the worker that solves it. The previous implementation
+    # formed all matrices serially in the parent while Pool.starmap consumed its
+    # input iterator.
+    if (
+        USE_MULTIPROCESSING
+        and transfer_rates is None
+        and external_source_rates is None
+    ):
+        if matrix_args:
+            per_material_args = zip(*matrix_args)
+        else:
+            per_material_args = repeat(())
+        inputs = zip(
+            rates,
+            fission_yields,
+            n,
+            repeat(dt),
+            per_material_args,
+        )
+        with Pool(
+            NUM_PROCESSES,
+            initializer=_initialize_depletion_worker,
+            initargs=(func, chain, matrix_func),
+        ) as worker_pool:
+            return list(
+                worker_pool.starmap(_form_matrix_and_deplete, inputs)
+            )
 
     if matrix_func is None:
         matrices = map(chain.form_matrix, rates, fission_yields)
