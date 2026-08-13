@@ -7,6 +7,8 @@ from . import _dll
 
 def _error_handler(err, func, args):
     """Raise exception according to error code."""
+    if err == 0:
+        return
 
     # Get error code corresponding to global constant.
     def errcode(s):

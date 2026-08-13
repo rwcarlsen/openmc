@@ -384,7 +384,9 @@ class FluxCollapseHelper(ReactionRateHelper):
 
         mat = self._materials[mat_index]
 
+        temperature = mat.temperature # overloaded dot operator is slow - cache result
         for name, i_nuc in zip(self.nuclides, nuc_index):
+            nuc = openmc.lib.nuclides[name]
             for mt, score, i_rx in zip(self._mts, self._scores, react_index):
                 if score in self._reactions_direct and name in nuclides_direct:
                     # Get reaction rate from tally
@@ -393,9 +395,8 @@ class FluxCollapseHelper(ReactionRateHelper):
                     self._results_cache[i_nuc, i_rx] = rx_rates[i_nuc_direct, i_rx_direct]
                 else:
                     # Use flux to collapse reaction rate (per N)
-                    nuc = openmc.lib.nuclides[name]
                     rate_per_nuc = nuc.collapse_rate(
-                        mt, mat.temperature, self._energies, flux)
+                        mt, temperature, self._energies, flux)
 
                     self._results_cache[i_nuc, i_rx] = rate_per_nuc
 
