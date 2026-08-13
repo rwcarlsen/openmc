@@ -11,6 +11,8 @@ import sys
 
 from numpy import dot, zeros, newaxis, asarray
 
+import numpy as np
+
 from openmc.mpi import comm
 from openmc.checkvalue import check_type, check_greater_than
 from openmc.data import JOULE_PER_EV, REACTION_MT
@@ -262,9 +264,19 @@ class FluxCollapseHelper(ReactionRateHelper):
         self._reactions_direct = list(reactions) if reactions is not None else []
         self._nuclides_direct = list(nuclides) if nuclides is not None else None
 
+        # Microscopic group coefficients persist across transport cycles.
+        self._collapse_coeff_cache = {}
+        # Material rates depend on each cycle's newly tallied flux.
+        self._collapsed_rate_cache = None
+
     @ReactionRateHelper.nuclides.setter
     def nuclides(self, nuclides):
+        previous = tuple(self._nuclides or ())
         ReactionRateHelper.nuclides.fset(self, nuclides)
+        if tuple(nuclides) != previous:
+            self._collapse_coeff_cache.clear()
+            self._collapsed_rate_cache = None
+
         if self._reactions_direct and self._nuclides_direct is None:
             self._rate_tally.nuclides = nuclides
 
@@ -321,6 +333,9 @@ class FluxCollapseHelper(ReactionRateHelper):
                     load_nuclide(nuc)
                 self._rate_tally.nuclides = self._nuclides_direct
 
+        self._collapse_coeff_cache.clear()
+        self._collapsed_rate_cache = None
+
     @property
     def rate_tally_means(self):
         """The mean results of the tally of every material's reaction rates for this cycle
@@ -344,8 +359,71 @@ class FluxCollapseHelper(ReactionRateHelper):
                 This step must be performed after each transport cycle
         """
         self._flux_tally_means_cache = None
+        self._collapsed_rate_cache = None
+
         if self._reactions_direct:
             self._rate_tally_means_cache = None
+
+    def _get_collapse_coefficients(self, temperature):
+        """Return microscopic rates for unit flux in each energy group."""
+        key = (
+            float(temperature),
+            tuple(self.nuclides),
+            tuple(self._mts),
+            tuple(self._energies),
+        )
+        coefficients = self._collapse_coeff_cache.get(key)
+        if coefficients is not None:
+            return coefficients
+        n_nuclides = len(self.nuclides)
+        n_reactions = len(self._mts)
+        n_groups = len(self._energies) - 1
+        coefficients = np.empty(
+            (n_nuclides, n_reactions, n_groups), dtype=float
+        )
+        unit_flux = np.zeros(n_groups, dtype=float)
+        for i_nuclide, name in enumerate(self.nuclides):
+            nuclide = openmc.lib.nuclides[name]
+            for i_reaction, mt in enumerate(self._mts):
+                for group in range(n_groups):
+                    unit_flux[group] = 1.0
+                    coefficients[i_nuclide, i_reaction, group] = (
+                        nuclide.collapse_rate(
+                            mt, temperature, self._energies, unit_flux
+                        )
+                    )
+                    unit_flux[group] = 0.0
+        self._collapse_coeff_cache[key] = coefficients
+        return coefficients
+
+    def _build_collapsed_rate_cache(self):
+        """Collapse rates for all materials using dense matrix products."""
+        n_materials = len(self._materials)
+        n_groups = len(self._energies) - 1
+        n_nuclides = len(self.nuclides)
+        n_reactions = len(self._mts)
+        fluxes = self.flux_tally_means.reshape(n_materials, n_groups)
+        rates = np.empty(
+            (n_materials, n_nuclides, n_reactions), dtype=float
+        )
+        materials_by_temperature = defaultdict(list)
+        for material_index, material in enumerate(self._materials):
+            materials_by_temperature[float(material.temperature)].append(
+                material_index
+            )
+        for temperature, material_indices in materials_by_temperature.items():
+            indices = np.asarray(material_indices, dtype=int)
+            coefficients = self._get_collapse_coefficients(temperature)
+            # Flatten nuclide/reaction dimensions for matrix multiplication:
+            # [materials, groups] @ [groups, nuclide*reaction]
+            coefficient_matrix = coefficients.reshape(
+                n_nuclides * n_reactions, n_groups
+            )
+            collapsed = fluxes[indices] @ coefficient_matrix.T
+            rates[indices] = collapsed.reshape(
+                len(indices), n_nuclides, n_reactions
+            )
+        self._collapsed_rate_cache = rates
 
     def get_material_rates(self, mat_index, nuc_index, react_index):
         """Return an array of reaction rates for a material
@@ -368,40 +446,41 @@ class FluxCollapseHelper(ReactionRateHelper):
 
         """
         self._results_cache.fill(0.0)
-
-        # Get flux for specified material
-        shape = (len(self._materials), len(self._energies) - 1)
-        mean_value = self.flux_tally_means.reshape(shape)
-        flux = mean_value[mat_index]
-
-        # Get direct reaction rates
+        if self._collapsed_rate_cache is None:
+            self._build_collapsed_rate_cache()
+        collapsed = self._collapsed_rate_cache[mat_index]
+        result_rows = np.asarray(nuc_index, dtype=int)
+        result_columns = np.asarray(react_index, dtype=int)
+        self._results_cache[np.ix_(result_rows, result_columns)] = collapsed
+        # Directly tallied reactions override flux-collapsed values.
         if self._reactions_direct:
-            nuclides_direct = self._rate_tally.nuclides
-            shape = (len(nuclides_direct), len(self._reactions_direct))
-            rx_rates = self.rate_tally_means[mat_index].reshape(shape)
-            direct_rx_index = {score: i for i, score in enumerate(self._reactions_direct)}
-            direct_nuc_index = {nuc: i for i, nuc in enumerate(nuclides_direct)}
-
-        mat = self._materials[mat_index]
-
-        temperature = mat.temperature # overloaded dot operator is slow - cache result
-        for name, i_nuc in zip(self.nuclides, nuc_index):
-            nuc = openmc.lib.nuclides[name]
-            for mt, score, i_rx in zip(self._mts, self._scores, react_index):
-                if score in self._reactions_direct and name in nuclides_direct:
-                    # Get reaction rate from tally
-                    i_rx_direct = direct_rx_index[score]
-                    i_nuc_direct = direct_nuc_index[name]
-                    self._results_cache[i_nuc, i_rx] = rx_rates[i_nuc_direct, i_rx_direct]
-                else:
-                    # Use flux to collapse reaction rate (per N)
-                    rate_per_nuc = nuc.collapse_rate(
-                        mt, temperature, self._energies, flux)
-
-                    self._results_cache[i_nuc, i_rx] = rate_per_nuc
-
+            direct_nuclides = list(self._rate_tally.nuclides)
+            direct_nuclide_index = {
+                name: i for i, name in enumerate(direct_nuclides)
+            }
+            direct_reaction_index = {
+                name: i for i, name in enumerate(self._reactions_direct)
+            }
+            shape = (
+                len(direct_nuclides),
+                len(self._reactions_direct),
+            )
+            direct_rates = self.rate_tally_means[mat_index].reshape(shape)
+            for local_nuclide, (name, output_nuclide) in enumerate(
+                    zip(self.nuclides, nuc_index)):
+                direct_nuclide = direct_nuclide_index.get(name)
+                if direct_nuclide is None:
+                    continue
+                for local_reaction, (score, output_reaction) in enumerate(
+                        zip(self._scores, react_index)):
+                    direct_reaction = direct_reaction_index.get(score)
+                    if direct_reaction is not None:
+                        self._results_cache[
+                            output_nuclide, output_reaction
+                        ] = direct_rates[
+                            direct_nuclide, direct_reaction
+                        ]
         return self._results_cache
-
 
 # ------------------------------------------
 # Helpers for obtaining normalization factor
