@@ -449,6 +449,8 @@ class FluxCollapseHelper(ReactionRateHelper):
         if self._collapsed_rate_cache is None:
             self._build_collapsed_rate_cache()
         collapsed = self._collapsed_rate_cache[mat_index]
+        nuc_index = tuple(nuc_index)
+        react_index = tuple(react_index)
         result_rows = np.asarray(nuc_index, dtype=int)
         result_columns = np.asarray(react_index, dtype=int)
         self._results_cache[np.ix_(result_rows, result_columns)] = collapsed

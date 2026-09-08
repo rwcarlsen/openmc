@@ -20,6 +20,7 @@ from openmc.deplete import (
     ReactionRates, StepResult, Results, OperatorResult, PredictorIntegrator,
     CECMIntegrator, CF4Integrator, CELIIntegrator, EPCRK4Integrator,
     LEQIIntegrator, SICELIIntegrator, SILEQIIntegrator, cram, pool)
+from openmc.deplete.helpers import FluxCollapseHelper
 
 from tests import dummy_operator
 
@@ -291,6 +292,56 @@ def test_substep_aware_custom_solver_receives_substeps(monkeypatch):
     _, result = integrator._timed_deplete(n, rates, 0.75)
 
     np.testing.assert_array_equal(result[0], n[0] + 3)
+
+
+def test_multiprocessing_solver_receives_substeps(monkeypatch):
+    operator = dummy_operator.DummyOperator()
+    n = operator.initial_condition()
+    rates = operator(n, 1.0).rates
+    integrator = PredictorIntegrator(
+        operator, [0.75], power=1.0, solver=mock_good_solver_substeps,
+        substeps=3)
+    monkeypatch.setattr(pool, "USE_MULTIPROCESSING", True)
+    monkeypatch.setattr(pool, "NUM_PROCESSES", 1)
+
+    _, result = integrator._timed_deplete(n, rates, 0.75)
+
+    np.testing.assert_array_equal(result[0], n[0] + 3)
+
+
+def test_custom_matrix_func_runs_in_parent(monkeypatch):
+    operator = dummy_operator.DummyOperator()
+    n = operator.initial_condition()
+    rates = operator(n, 1.0).rates
+    integrator = PredictorIntegrator(
+        operator, [0.75], power=1.0, solver=mock_good_solver)
+    calls = []
+
+    def matrix_func(chain, rate, fission_yields):
+        calls.append(rate)
+        return chain.form_matrix(rate, fission_yields)
+
+    monkeypatch.setattr(pool, "USE_MULTIPROCESSING", True)
+    monkeypatch.setattr(pool, "NUM_PROCESSES", 1)
+
+    integrator._timed_deplete(
+        n, rates, 0.75, matrix_func=matrix_func)
+
+    assert len(calls) == len(n)
+
+
+def test_flux_collapse_rate_indexes_accept_generators():
+    helper = FluxCollapseHelper(3, 2, [0.0, 1.0])
+    helper._materials = [None]
+    helper._nuclides = ["U235", "U238"]
+    helper._mts = [18, 102]
+    helper._scores = ["fission", "(n,gamma)"]
+    helper._collapsed_rate_cache = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+
+    rates = helper.get_material_rates(
+        0, (index for index in [0, 2]), (index for index in [0, 1]))
+
+    np.testing.assert_array_equal(rates, [[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
 
 
 def test_custom_solver_propagates_substeps_error(monkeypatch):
