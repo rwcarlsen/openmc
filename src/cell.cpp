@@ -6,7 +6,6 @@
 #include <cctype>
 #include <cmath>
 #include <iterator>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -21,11 +20,76 @@
 #include "openmc/hdf5_interface.h"
 #include "openmc/lattice.h"
 #include "openmc/material.h"
+#include "openmc/model/geometry/compiled_geometry.h"
 #include "openmc/nuclide.h"
 #include "openmc/settings.h"
 #include "openmc/xml_interface.h"
 
 namespace openmc {
+
+namespace {
+
+BoundingBox conservative_halfspace_bound(const Surface& surface, bool positive)
+{
+  BoundingBox bbox = surface.bounding_box(positive);
+  double padding {0.0};
+  if (dynamic_cast<const SurfaceXPlane*>(&surface) ||
+      dynamic_cast<const SurfaceYPlane*>(&surface) ||
+      dynamic_cast<const SurfaceZPlane*>(&surface)) {
+    padding = FP_COINCIDENT;
+  } else if (!positive) {
+    double radius {-1.0};
+    if (const auto* cylinder = dynamic_cast<const SurfaceXCylinder*>(&surface)) {
+      radius = cylinder->radius_;
+    } else if (const auto* cylinder =
+                 dynamic_cast<const SurfaceYCylinder*>(&surface)) {
+      radius = cylinder->radius_;
+    } else if (const auto* cylinder =
+                 dynamic_cast<const SurfaceZCylinder*>(&surface)) {
+      radius = cylinder->radius_;
+    } else if (const auto* sphere =
+                 dynamic_cast<const SurfaceSphere*>(&surface)) {
+      radius = sphere->radius_;
+    }
+    if (radius >= 0.0) {
+      padding = FP_COINCIDENT /
+                (std::sqrt(radius * radius + FP_COINCIDENT) + radius);
+    } else {
+      // An unknown finite bound cannot account for Surface::sense tolerance.
+      return BoundingBox::infinite();
+    }
+  }
+
+  for (int axis = 0; axis < 3; ++axis) {
+    if (bbox.min[axis] > -INFTY) {
+      bbox.min[axis] =
+        std::nextafter(bbox.min[axis] - padding, -INFINITY);
+    }
+    if (bbox.max[axis] < INFTY) {
+      bbox.max[axis] = std::nextafter(bbox.max[axis] + padding, INFINITY);
+    }
+  }
+  return bbox;
+}
+
+BoundingBox conservative_surface_bound(const Surface& surface)
+{
+  BoundingBox bbox =
+    surface.bounding_box(false) & surface.bounding_box(true);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (bbox.min[axis] > -INFTY) {
+      bbox.min[axis] =
+        std::nextafter(bbox.min[axis] - FP_COINCIDENT, -INFINITY);
+    }
+    if (bbox.max[axis] < INFTY) {
+      bbox.max[axis] =
+        std::nextafter(bbox.max[axis] + FP_COINCIDENT, INFINITY);
+    }
+  }
+  return bbox;
+}
+
+} // namespace
 
 //==============================================================================
 // Global variables
@@ -714,6 +778,7 @@ Region::Region(std::string region_spec, int32_t cell_id)
       if (token < OP_UNION && seen_surfaces.insert(std::abs(token)).second) {
         surface_tokens_.push_back(token);
         const Surface* surface = model::surfaces[std::abs(token) - 1].get();
+        surface_bounds_.push_back(conservative_surface_bound(*surface));
         PlaneKernel kernel;
         if (const auto* plane = dynamic_cast<const SurfaceXPlane*>(surface)) {
           kernel.type = PlaneType::X;
@@ -740,7 +805,7 @@ Region::Region(std::string region_spec, int32_t cell_id)
       }
     }
     surface_tokens_.shrink_to_fit();
-    if (simple_ || !all_surfaces_are_planes_) {
+    if (simple_) {
       plane_kernels_.clear();
     }
     plane_kernels_.shrink_to_fit();
@@ -757,7 +822,10 @@ Region::Region(std::string region_spec, int32_t cell_id)
         if (token < OP_UNION) {
           const int node = boolean_nodes_.size();
           const std::size_t surface = surface_positions.at(std::abs(token));
-          boolean_nodes_.push_back({token, -1, -1, -1, surface});
+          const auto& surf = *model::surfaces[std::abs(token) - 1];
+          const BoundingBox bbox =
+            conservative_halfspace_bound(surf, token > 0);
+          boolean_nodes_.push_back({token, -1, -1, -1, surface, bbox});
           surface_leaf_nodes_[surface].push_back(node);
           node_stack.push_back(node);
         } else {
@@ -766,17 +834,21 @@ Region::Region(std::string region_spec, int32_t cell_id)
           const int left = node_stack.back();
           node_stack.pop_back();
           const int node = boolean_nodes_.size();
-          boolean_nodes_.push_back({token, left, right});
+          const BoundingBox bbox = token == OP_INTERSECTION
+                                     ? boolean_nodes_[left].bbox &
+                                         boolean_nodes_[right].bbox
+                                     : boolean_nodes_[left].bbox |
+                                         boolean_nodes_[right].bbox;
+          boolean_nodes_.push_back({token, left, right, -1, 0, bbox});
           boolean_nodes_[left].parent = node;
           boolean_nodes_[right].parent = node;
           node_stack.push_back(node);
         }
       }
       boolean_root_ = node_stack.back();
+      balance_boolean_tree();
     }
 
-    // Record the closing parenthesis for every operator in a parenthesized
-    // expression. This turns each runtime short-circuit scan into one lookup.
     short_circuit_jump_.assign(expression_.size(), expression_.size());
     vector<vector<std::size_t>> operators_by_depth;
     for (std::size_t i = 0; i < expression_.size(); ++i) {
@@ -798,6 +870,65 @@ Region::Region(std::string region_spec, int32_t cell_id)
   } else {
     simple_ = true;
   }
+}
+
+//==============================================================================
+
+void Region::balance_boolean_tree()
+{
+  vector<BooleanNode> old_nodes = std::move(boolean_nodes_);
+  boolean_nodes_.clear();
+  boolean_nodes_.reserve(old_nodes.size());
+  for (auto& leaves : surface_leaf_nodes_)
+    leaves.clear();
+
+  std::function<void(int, int32_t, vector<int>&)> collect_operands;
+  collect_operands = [&](int node, int32_t token, vector<int>& operands) {
+    const auto& item = old_nodes[node];
+    if (item.token == token) {
+      collect_operands(item.left, token, operands);
+      collect_operands(item.right, token, operands);
+    } else {
+      operands.push_back(node);
+    }
+  };
+
+  std::function<int(int)> rebuild;
+  std::function<int(const vector<int>&, std::size_t, std::size_t, int32_t)>
+    join;
+  join = [&](const vector<int>& operands, std::size_t begin, std::size_t end,
+           int32_t token) {
+    if (end - begin == 1)
+      return rebuild(operands[begin]);
+    const std::size_t middle = begin + (end - begin) / 2;
+    const int left = join(operands, begin, middle, token);
+    const int right = join(operands, middle, end, token);
+    const int node = boolean_nodes_.size();
+    const BoundingBox bbox = token == OP_INTERSECTION
+                               ? boolean_nodes_[left].bbox &
+                                   boolean_nodes_[right].bbox
+                               : boolean_nodes_[left].bbox |
+                                   boolean_nodes_[right].bbox;
+    boolean_nodes_.push_back({token, left, right, -1, 0, bbox});
+    boolean_nodes_[left].parent = node;
+    boolean_nodes_[right].parent = node;
+    return node;
+  };
+  rebuild = [&](int old_node) {
+    const auto& item = old_nodes[old_node];
+    if (item.token < OP_UNION) {
+      const int node = boolean_nodes_.size();
+      boolean_nodes_.push_back(
+        {item.token, -1, -1, -1, item.surface, item.bbox});
+      surface_leaf_nodes_[item.surface].push_back(node);
+      return node;
+    }
+
+    vector<int> operands;
+    collect_operands(old_node, item.token, operands);
+    return join(operands, 0, operands.size(), item.token);
+  };
+  boolean_root_ = rebuild(boolean_root_);
 }
 
 //==============================================================================
@@ -1043,15 +1174,21 @@ std::pair<double, int32_t> Region::distance(
   if (simple_) {
     return distance_to_nearest_surface(
       r, u, on_surface, false, max_distance);
+  }
+
+  const auto& candidates = candidate_surfaces(r, u, max_distance);
+  if (candidates.empty()) {
+    if (known_inside || on_surface != 0) {
+      return distance_complex_fallback(
+        r, u, on_surface, known_inside, max_distance);
+    }
+    return {INFTY, std::numeric_limits<int32_t>::max()};
   } else if (all_surfaces_are_planes_) {
     return distance_complex_planes(
-      r, u, on_surface, known_inside, max_distance);
-  } else if (surface_tokens_.size() <= 8 || surface_tokens_.size() >= 512) {
-    // Queue setup pays off for tiny or very large mixed-surface expressions.
-    return distance_complex(r, u, on_surface, known_inside, max_distance);
+      r, u, on_surface, known_inside, max_distance, candidates);
   } else {
-    return distance_complex_fallback(
-      r, u, on_surface, known_inside, max_distance);
+    return distance_complex(
+      r, u, on_surface, known_inside, max_distance, candidates);
   }
 }
 
@@ -1059,12 +1196,17 @@ std::pair<double, int32_t> Region::distance(
 
 std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
   Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
-  double max_distance) const
+  double max_distance, const vector<std::size_t>* candidate_surfaces) const
 {
   double min_dist {INFTY};
   int32_t i_surf {std::numeric_limits<int32_t>::max()};
 
-  for (int32_t token : surface_tokens_) {
+  const std::size_t n =
+    candidate_surfaces ? candidate_surfaces->size() : surface_tokens_.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::size_t surface =
+      candidate_surfaces ? (*candidate_surfaces)[i] : i;
+    const int32_t token = surface_tokens_[surface];
     // Calculate the distance to this surface.
     // Note the off-by-one indexing
     bool coincident {std::abs(token) == std::abs(on_surface)};
@@ -1095,7 +1237,7 @@ std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
 
 std::pair<double, int32_t> Region::distance_complex(
   Position r, Direction u, int32_t on_surface, bool known_inside,
-  double max_distance) const
+  double max_distance, const vector<std::size_t>& candidate_surfaces) const
 {
   struct SurfaceEvent {
     double distance;
@@ -1109,19 +1251,26 @@ std::pair<double, int32_t> Region::distance_complex(
     }
   };
 
-  std::priority_queue<SurfaceEvent, vector<SurfaceEvent>, EventCompare> events;
-  for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+  static thread_local vector<SurfaceEvent> events;
+  events.clear();
+  events.reserve(candidate_surfaces.size());
+  for (std::size_t i : candidate_surfaces) {
     const int32_t token = surface_tokens_[i];
     const bool coincident {std::abs(token) == std::abs(on_surface)};
     const double distance =
-      model::surfaces[std::abs(token) - 1]->distance(r, u, coincident);
+      plane_kernels_[i].type != PlaneType::NONE
+        ? plane_distance(i, r, u, coincident)
+        : model::surfaces[std::abs(token) - 1]->distance(r, u, coincident);
     if ((on_surface == 0 || distance >= FP_COINCIDENT) &&
         distance < max_distance) {
-      events.push({distance, i});
+      events.push_back({distance, i});
     }
   }
+  EventCompare compare;
+  std::make_heap(events.begin(), events.end(), compare);
 
-  vector<int8_t> boolean_values(boolean_nodes_.size(), -1);
+  static thread_local vector<int8_t> boolean_values;
+  boolean_values.assign(boolean_nodes_.size(), -1);
   if (on_surface != 0) {
     for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
       if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
@@ -1135,18 +1284,19 @@ std::pair<double, int32_t> Region::distance_complex(
                            boolean_root_, r, u, boolean_values);
 
   while (!events.empty()) {
-    const SurfaceEvent event = events.top();
-    events.pop();
+    std::pop_heap(events.begin(), events.end(), compare);
+    const SurfaceEvent event = events.back();
+    events.pop_back();
 
     // Near-simultaneous roots can depend on expression order and on_surface
     // tie-breaking. Preserve those cases with the exact rescan traversal.
     if (!events.empty()) {
-      const double next = events.top().distance;
+      const double next = events.front().distance;
       const double tolerance = std::max(FP_COINCIDENT,
         FP_PRECISION * std::max(std::abs(event.distance), std::abs(next)));
       if (next - event.distance < tolerance) {
         return distance_complex_fallback(
-          r, u, on_surface, known_inside, max_distance);
+          r, u, on_surface, known_inside, max_distance, &candidate_surfaces);
       }
     }
 
@@ -1154,11 +1304,15 @@ std::pair<double, int32_t> Region::distance_complex(
     int32_t i_surf = std::abs(token);
     const Position r_hit = r + event.distance * u;
     const auto& surf {*model::surfaces[i_surf - 1]};
-    const Direction normal = surf.normal(r_hit);
-    const double normal_projection = u.dot(normal);
-    if (std::abs(normal_projection) <= FP_PRECISION * normal.norm()) {
+    const bool is_plane = plane_kernels_[event.surface].type != PlaneType::NONE;
+    const Direction normal = is_plane ? Direction {} : surf.normal(r_hit);
+    const double normal_projection = is_plane
+                                       ? plane_normal_projection(event.surface, u)
+                                       : u.dot(normal);
+    const double normal_norm = is_plane ? 1.0 : normal.norm();
+    if (std::abs(normal_projection) <= FP_PRECISION * normal_norm) {
       return distance_complex_fallback(
-        r, u, on_surface, known_inside, max_distance);
+        r, u, on_surface, known_inside, max_distance, &candidate_surfaces);
     }
     if (normal_projection < 0.0) {
       i_surf = -i_surf;
@@ -1173,11 +1327,12 @@ std::pair<double, int32_t> Region::distance_complex(
     const double next = surf.distance(r_hit, u, true);
     if (next < FP_COINCIDENT) {
       return distance_complex_fallback(
-        r, u, on_surface, known_inside, max_distance);
+        r, u, on_surface, known_inside, max_distance, &candidate_surfaces);
     }
     if (next < INFTY - event.distance &&
         next + event.distance < max_distance) {
-      events.push({event.distance + next, event.surface});
+      events.push_back({event.distance + next, event.surface});
+      std::push_heap(events.begin(), events.end(), compare);
     }
   }
 
@@ -1188,37 +1343,39 @@ std::pair<double, int32_t> Region::distance_complex(
 
 std::pair<double, int32_t> Region::distance_complex_fallback(
   Position r, Direction u, int32_t on_surface, bool known_inside,
-  double max_distance) const
+  double max_distance, const vector<std::size_t>* candidate_surfaces) const
 {
   const bool in_region = known_inside || contains_complex(r, u, on_surface);
-  double total_distance {0.0};
+  auto search = [&](const vector<std::size_t>* candidates) {
+    Position current_r {r};
+    int32_t current_surface {on_surface};
+    double total_distance {0.0};
 
-  while (true) {
-    auto [distance, i_surf] = distance_to_nearest_surface(r, u, on_surface,
-      on_surface != 0, max_distance - total_distance);
-    if (distance == INFTY) {
-      return {INFTY, std::numeric_limits<int32_t>::max()};
-    }
+    while (true) {
+      auto [distance, i_surf] = distance_to_nearest_surface(current_r, u,
+        current_surface, current_surface != 0, max_distance - total_distance,
+        candidates);
+      if (distance == INFTY) {
+        return std::pair<double, int32_t> {
+          INFTY, std::numeric_limits<int32_t>::max()};
+      }
 
-    // Move to the candidate surface and determine which side of it the ray is
-    // entering. The surface normal is used instead of evaluating the surface
-    // equation because accumulated roundoff may place the point slightly to
-    // the wrong side of a curved surface.
-    r += distance * u;
-    total_distance += distance;
-    i_surf = std::abs(i_surf);
-    const auto& surf {*model::surfaces[i_surf - 1]};
-    if (u.dot(surf.normal(r)) <= 0.0) {
-      i_surf = -i_surf;
-    }
+      // Use the normal at the hit rather than a surface evaluation because
+      // accumulated roundoff may put a curved-surface hit on the wrong side.
+      current_r += distance * u;
+      total_distance += distance;
+      i_surf = std::abs(i_surf);
+      const auto& surf {*model::surfaces[i_surf - 1]};
+      if (u.dot(surf.normal(current_r)) <= 0.0)
+        i_surf = -i_surf;
 
-    // If crossing the candidate changes the region membership, it is a true
-    // boundary. Otherwise, continue the search from the virtual crossing.
-    if (contains_complex(r, u, i_surf) != in_region) {
-      return {total_distance, i_surf};
+      if (contains_complex(current_r, u, i_surf) != in_region)
+        return std::pair<double, int32_t> {total_distance, i_surf};
+      current_surface = i_surf;
     }
-    on_surface = i_surf;
-  }
+  };
+
+  return search(candidate_surfaces);
 }
 
 //==============================================================================
@@ -1233,7 +1390,7 @@ bool Region::evaluate_boolean_node(
   const auto& item = boolean_nodes_[node];
   bool value;
   if (item.token < OP_UNION) {
-    const bool sense = all_surfaces_are_planes_
+    const bool sense = plane_kernels_[item.surface].type != PlaneType::NONE
                          ? plane_sense(item.surface, r, u)
                          : model::surfaces[std::abs(item.token) - 1]->sense(r, u);
     set_surface_boolean_value(item.surface, sense, values);
@@ -1247,6 +1404,122 @@ bool Region::evaluate_boolean_node(
   }
   values[node] = value;
   return value;
+}
+
+//==============================================================================
+
+const vector<std::size_t>& Region::candidate_surfaces(
+  Position r, Direction u, double max_distance) const
+{
+  struct WorkItem {
+    int node;
+    double entry;
+    double exit;
+  };
+  struct Scratch {
+    vector<std::size_t> candidates;
+    vector<WorkItem> stack;
+    vector<uint32_t> marks;
+    uint32_t epoch {0};
+  };
+  static thread_local Scratch scratch;
+
+  scratch.candidates.clear();
+  scratch.stack.clear();
+  scratch.candidates.reserve(surface_tokens_.size());
+  scratch.stack.reserve(boolean_nodes_.size());
+  if (scratch.marks.size() < surface_tokens_.size())
+    scratch.marks.resize(surface_tokens_.size(), 0);
+  if (++scratch.epoch == 0) {
+    std::fill(scratch.marks.begin(), scratch.marks.end(), 0);
+    ++scratch.epoch;
+  }
+
+  double entry {0.0};
+  double exit {max_distance};
+  if (!intersect_bound(boolean_nodes_[boolean_root_].bbox, r, u, entry, exit))
+    return scratch.candidates;
+  scratch.stack.push_back({boolean_root_, entry, exit});
+
+  while (!scratch.stack.empty()) {
+    const WorkItem work = scratch.stack.back();
+    scratch.stack.pop_back();
+    const auto& node = boolean_nodes_[work.node];
+    if (node.token < OP_UNION) {
+      double surface_entry {work.entry};
+      double surface_exit {work.exit};
+      if (intersect_bound(surface_bounds_[node.surface], r, u, surface_entry,
+            surface_exit) &&
+          scratch.marks[node.surface] != scratch.epoch) {
+        scratch.marks[node.surface] = scratch.epoch;
+        scratch.candidates.push_back(node.surface);
+      }
+    } else if (node.token == OP_INTERSECTION) {
+      scratch.stack.push_back({node.right, work.entry, work.exit});
+      scratch.stack.push_back({node.left, work.entry, work.exit});
+    } else {
+      double child_entry {work.entry};
+      double child_exit {work.exit};
+      if (intersect_bound(boolean_nodes_[node.right].bbox, r, u, child_entry,
+            child_exit)) {
+        scratch.stack.push_back({node.right, child_entry, child_exit});
+      }
+      child_entry = work.entry;
+      child_exit = work.exit;
+      if (intersect_bound(boolean_nodes_[node.left].bbox, r, u, child_entry,
+            child_exit)) {
+        scratch.stack.push_back({node.left, child_entry, child_exit});
+      }
+    }
+  }
+  return scratch.candidates;
+}
+
+//==============================================================================
+
+bool Region::intersect_bound(const BoundingBox& bbox, Position r, Direction u,
+  double& entry, double& exit) const
+{
+  if (bbox.min.x == -INFTY && bbox.min.y == -INFTY &&
+      bbox.min.z == -INFTY && bbox.max.x == INFTY &&
+      bbox.max.y == INFTY && bbox.max.z == INFTY)
+    return true;
+
+  // Check parallel slabs first. Disjoint union branches are commonly rejected
+  // here without any divisions.
+  for (int axis = 0; axis < 3; ++axis) {
+    const double lower = bbox.min[axis];
+    const double upper = bbox.max[axis];
+    if (lower <= -INFTY && upper >= INFTY)
+      continue;
+    if (std::isnan(r[axis]) || std::isnan(u[axis]) || std::isnan(lower) ||
+        std::isnan(upper))
+      return true;
+    if (lower > upper)
+      return false;
+    if (u[axis] == 0.0) {
+      if (r[axis] < lower || r[axis] > upper)
+        return false;
+    }
+  }
+
+  for (int axis = 0; axis < 3; ++axis) {
+    const double lower = bbox.min[axis];
+    const double upper = bbox.max[axis];
+    if (lower <= -INFTY && upper >= INFTY)
+      continue;
+    if (u[axis] == 0.0)
+      continue;
+    double axis_entry = (lower - r[axis]) / u[axis];
+    double axis_exit = (upper - r[axis]) / u[axis];
+    if (axis_entry > axis_exit)
+      std::swap(axis_entry, axis_exit);
+    entry = std::max(entry, axis_entry);
+    exit = std::min(exit, axis_exit);
+    if (entry > exit)
+      return false;
+  }
+  return entry <= exit && exit >= 0.0;
 }
 
 //==============================================================================
@@ -1358,7 +1631,8 @@ bool Region::plane_sense(
 //==============================================================================
 
 std::pair<double, int32_t> Region::distance_complex_planes(Position r,
-  Direction u, int32_t on_surface, bool known_inside, double max_distance) const
+  Direction u, int32_t on_surface, bool known_inside, double max_distance,
+  const vector<std::size_t>& candidate_surfaces) const
 {
   struct Crossing {
     double distance;
@@ -1367,9 +1641,10 @@ std::pair<double, int32_t> Region::distance_complex_planes(Position r,
     bool used;
   };
 
-  vector<Crossing> crossings;
-  crossings.reserve(surface_tokens_.size());
-  for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+  static thread_local vector<Crossing> crossings;
+  crossings.clear();
+  crossings.reserve(candidate_surfaces.size());
+  for (std::size_t i : candidate_surfaces) {
     const int32_t token = surface_tokens_[i];
     const bool coincident {std::abs(token) == std::abs(on_surface)};
     const double distance = plane_distance(i, r, u, coincident);
@@ -1379,7 +1654,8 @@ std::pair<double, int32_t> Region::distance_complex_planes(Position r,
     }
   }
 
-  vector<int8_t> boolean_values(boolean_nodes_.size(), -1);
+  static thread_local vector<int8_t> boolean_values;
+  boolean_values.assign(boolean_nodes_.size(), -1);
   if (on_surface != 0) {
     for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
       if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
@@ -1419,7 +1695,7 @@ std::pair<double, int32_t> Region::distance_complex_planes(Position r,
         FP_PRECISION * std::max(std::abs(min_distance), std::abs(distance)));
       if (std::abs(distance - min_distance) < tolerance) {
         return distance_complex_fallback(
-          r, u, on_surface, known_inside, max_distance);
+          r, u, on_surface, known_inside, max_distance, &candidate_surfaces);
       }
     }
 
@@ -1719,6 +1995,9 @@ extern "C" int openmc_cell_set_fill(
     } else {
       c.type_ = Fill::LATTICE;
     }
+    model::geometry::mark_dirty(
+      model::geometry::GeometryChange::TOPOLOGY |
+      model::geometry::GeometryChange::PROPERTY);
   } else {
     set_errmsg("Index in cells array is out of bounds.");
     return OPENMC_E_OUT_OF_BOUNDS;
@@ -1741,6 +2020,7 @@ extern "C" int openmc_cell_set_temperature(
     set_errmsg(e.what());
     return OPENMC_E_UNASSIGNED;
   }
+  model::geometry::mark_dirty(model::geometry::GeometryChange::PROPERTY);
   return 0;
 }
 
@@ -1759,6 +2039,7 @@ extern "C" int openmc_cell_set_density(
     set_errmsg(e.what());
     return OPENMC_E_UNASSIGNED;
   }
+  model::geometry::mark_dirty(model::geometry::GeometryChange::PROPERTY);
   return 0;
 }
 
@@ -2202,8 +2483,16 @@ extern "C" int openmc_cell_get_id(int32_t index, int32_t* id)
 extern "C" int openmc_cell_set_id(int32_t index, int32_t id)
 {
   if (index >= 0 && index < model::cells.size()) {
+    const int32_t old_id = model::cells[index]->id_;
+    auto existing = model::cell_map.find(id);
+    if (existing != model::cell_map.end() && existing->second != index) {
+      set_errmsg("Cell ID=" + std::to_string(id) + " is already in use.");
+      return OPENMC_E_INVALID_ID;
+    }
+    model::cell_map.erase(old_id);
     model::cells[index]->id_ = id;
     model::cell_map[id] = index;
+    model::geometry::mark_dirty(model::geometry::GeometryChange::IDENTITY);
     return 0;
   } else {
     set_errmsg("Index in cells array is out of bounds.");
@@ -2237,6 +2526,7 @@ extern "C" int openmc_cell_set_translation(int32_t index, const double xyz[])
       return OPENMC_E_GEOMETRY;
     }
     model::cells[index]->translation_ = Position(xyz);
+    model::geometry::mark_dirty(model::geometry::GeometryChange::SPATIAL);
     return 0;
   } else {
     set_errmsg("Index in cells array is out of bounds.");
@@ -2271,6 +2561,7 @@ extern "C" int openmc_cell_set_rotation(
     }
     std::vector<double> vec_rot(rot, rot + rot_len);
     model::cells[index]->set_rotation(vec_rot);
+    model::geometry::mark_dirty(model::geometry::GeometryChange::SPATIAL);
     return 0;
   } else {
     set_errmsg("Index in cells array is out of bounds.");
@@ -2300,6 +2591,11 @@ extern "C" int openmc_extend_cells(
     *index_end = model::cells.size() + n - 1;
   for (int32_t i = 0; i < n; i++) {
     model::cells.push_back(make_unique<CSGCell>());
+  }
+  if (n > 0) {
+    model::geometry::mark_dirty(
+      model::geometry::GeometryChange::TOPOLOGY |
+      model::geometry::GeometryChange::IDENTITY);
   }
   return 0;
 }

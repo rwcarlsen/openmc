@@ -456,6 +456,7 @@ list(APPEND libopenmc_SOURCES
   src/mcpl_interface.cpp
   src/mesh.cpp
   src/message_passing.cpp
+  src/model/geometry/compiled_geometry.cpp
   src/mgxs.cpp
   src/mgxs_interface.cpp
   src/ncrystal_interface.cpp

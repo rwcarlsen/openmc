@@ -120,7 +120,8 @@ void cross_lattice(
 //! Find the next boundary a particle will intersect.
 //==============================================================================
 
-BoundaryInfo distance_to_boundary(GeometryState& p);
+BoundaryInfo distance_to_boundary(
+  GeometryState& p, double max_distance = INFTY);
 
 } // namespace openmc
 

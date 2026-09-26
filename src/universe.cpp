@@ -1,8 +1,11 @@
 #include "openmc/universe.h"
 
-#include <set>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "openmc/hdf5_interface.h"
+#include "openmc/model/geometry/compiled_geometry.h"
 #include "openmc/particle.h"
 
 namespace openmc {
@@ -39,25 +42,82 @@ void Universe::to_hdf5(hid_t universes_group) const
 
 bool Universe::find_cell(GeometryState& p) const
 {
-  const auto& cells {
-    !partitioner_ ? cells_ : partitioner_->get_cells(p.r_local(), p.u_local())};
-
   Position r {p.r_local()};
   Position u {p.u_local()};
   auto surf = p.surface();
   int32_t i_univ = p.lowest_coord().universe();
 
-  for (auto i_cell : cells) {
-    if (model::cells[i_cell]->universe_ != i_univ)
-      continue;
-    // Check if this cell contains the particle
-    if (model::cells[i_cell]->contains(r, u, surf)) {
-      p.lowest_coord().cell() = i_cell;
-      return true;
+  auto search = [&](const vector<int32_t>& cells) {
+    for (auto i_cell : cells) {
+      if (model::cells[i_cell]->universe_ != i_univ)
+        continue;
+      // Bounding boxes only select candidates. Exact region containment remains
+      // authoritative.
+      if (model::cells[i_cell]->contains(r, u, surf)) {
+        p.lowest_coord().cell() = i_cell;
+        return true;
+      }
     }
+    return false;
+  };
+
+  // A known surface can override its numerically evaluated sense, so an AABB
+  // based only on the coordinates is not sufficient for those searches.
+  if (!partitioner_ || surf != SURFACE_NONE ||
+      !model::geometry::is_spatial_current())
+    return search(cells_);
+
+  vector<int32_t> candidates;
+  partitioner_->get_cells(r, candidates);
+  if (search(candidates)) {
+    const int32_t candidate_match = p.lowest_coord().cell();
+    std::size_t candidate = 0;
+    for (auto i_cell : cells_) {
+      if (i_cell == candidate_match)
+        break;
+      if (candidate < candidates.size() && candidates[candidate] == i_cell) {
+        ++candidate;
+        continue;
+      }
+      if (model::cells[i_cell]->universe_ == i_univ &&
+          model::cells[i_cell]->contains(r, u, surf)) {
+        p.lowest_coord().cell() = i_cell;
+        return true;
+      }
+    }
+    p.lowest_coord().cell() = candidate_match;
+    return true;
   }
+
+  // Keep an exhaustive fallback so an unexpectedly conservative bound can
+  // never turn a successful point-location query into a lost particle.
+  if (candidates.size() < cells_.size())
+    return search(cells_);
+
   return false;
 }
+
+namespace {
+
+bool contains(const BoundingBox& box, Position r)
+{
+  return r.x >= box.min.x && r.x <= box.max.x && r.y >= box.min.y &&
+         r.y <= box.max.y && r.z >= box.min.z && r.z <= box.max.z;
+}
+
+bool finite_valid(const BoundingBox& box)
+{
+  for (int i = 0; i < 3; ++i) {
+    if (!std::isfinite(box.min[i]) || !std::isfinite(box.max[i]) ||
+        box.min[i] <= -INFTY || box.max[i] >= INFTY ||
+        box.min[i] > box.max[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
 
 BoundingBox Universe::bounding_box() const
 {
@@ -79,139 +139,112 @@ BoundingBox Universe::bounding_box() const
 
 UniversePartitioner::UniversePartitioner(const Universe& univ)
 {
-  // Define an ordered set of surface indices that point to z-planes.  Use a
-  // functor to to order the set by the z0_ values of the corresponding planes.
-  struct compare_surfs {
-    bool operator()(const int32_t& i_surf, const int32_t& j_surf) const
-    {
-      const auto* surf = model::surfaces[i_surf].get();
-      const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf);
-      double zi = zplane->z0_;
-      surf = model::surfaces[j_surf].get();
-      zplane = dynamic_cast<const SurfaceZPlane*>(surf);
-      double zj = zplane->z0_;
-      return zi < zj;
-    }
-  };
-  std::set<int32_t, compare_surfs> surf_set;
-
-  // Find all of the z-planes in this universe.  A set is used here for the
-  // O(log(n)) insertions that will ensure entries are not repeated.
-  for (auto i_cell : univ.cells_) {
-    for (auto token : model::cells[i_cell]->surfaces()) {
-      auto i_surf = std::abs(token) - 1;
-      const auto* surf = model::surfaces[i_surf].get();
-      if (const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf))
-        surf_set.insert(i_surf);
+  bounded_.reserve(univ.cells_.size());
+  spill_.reserve(univ.cells_.size());
+  for (int32_t order = 0; order < univ.cells_.size(); ++order) {
+    const int32_t i_cell = univ.cells_[order];
+    BoundingBox box = model::cells[i_cell]->bounding_box();
+    CellBounds item {box, i_cell, order};
+    if (finite_valid(box)) {
+      // Include the adjacent floating-point values to avoid rejecting points
+      // because a mathematically exact boundary rounded inward.
+      for (int axis = 0; axis < 3; ++axis) {
+        item.box.min[axis] = std::nextafter(
+          item.box.min[axis] - FP_COINCIDENT, -INFINITY);
+        item.box.max[axis] = std::nextafter(
+          item.box.max[axis] + FP_COINCIDENT, INFINITY);
+      }
+      bounded_.push_back(item);
+    } else {
+      spill_.push_back(item);
     }
   }
 
-  // Populate the surfs_ vector from the ordered set.
-  surfs_.insert(surfs_.begin(), surf_set.begin(), surf_set.end());
+  if (!bounded_.empty())
+    build(0, bounded_.size());
+}
 
-  // Populate the partition lists.
-  partitions_.resize(surfs_.size() + 1);
-  for (auto i_cell : univ.cells_) {
-    // It is difficult to determine the bounds of a complex cell, so add complex
-    // cells to all partitions.
-    if (!model::cells[i_cell]->is_simple()) {
-      for (auto& p : partitions_)
-        p.push_back(i_cell);
-      continue;
-    }
+int32_t UniversePartitioner::build(int32_t begin, int32_t end)
+{
+  const int32_t node_index = nodes_.size();
+  nodes_.push_back({});
+  auto& box = nodes_[node_index].box;
+  box = BoundingBox::inverted();
+  for (int32_t i = begin; i < end; ++i)
+    box |= bounded_[i].box;
 
-    // Find the tokens for bounding z-planes.
-    int32_t lower_token = 0, upper_token = 0;
-    double min_z, max_z;
-    for (auto token : model::cells[i_cell]->surfaces()) {
-      const auto* surf = model::surfaces[std::abs(token) - 1].get();
-      if (const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf)) {
-        if (lower_token == 0 || zplane->z0_ < min_z) {
-          lower_token = token;
-          min_z = zplane->z0_;
-        }
-        if (upper_token == 0 || zplane->z0_ > max_z) {
-          upper_token = token;
-          max_z = zplane->z0_;
-        }
-      }
-    }
+  constexpr int LEAF_SIZE = 4;
+  if (end - begin <= LEAF_SIZE) {
+    nodes_[node_index].begin = begin;
+    nodes_[node_index].end = end;
+    return node_index;
+  }
 
-    // If there are no bounding z-planes, add this cell to all partitions.
-    if (lower_token == 0) {
-      for (auto& p : partitions_)
-        p.push_back(i_cell);
-      continue;
+  Position centroid_min {INFTY, INFTY, INFTY};
+  Position centroid_max {-INFTY, -INFTY, -INFTY};
+  for (int32_t i = begin; i < end; ++i) {
+    for (int axis = 0; axis < 3; ++axis) {
+      const double center = bounded_[i].box.min[axis] +
+                            0.5 * (bounded_[i].box.max[axis] -
+                                    bounded_[i].box.min[axis]);
+      centroid_min[axis] = std::min(centroid_min[axis], center);
+      centroid_max[axis] = std::max(centroid_max[axis], center);
     }
+  }
 
-    // Find the first partition this cell lies in.  If the lower_token indicates
-    // a negative halfspace, then the cell is unbounded in the lower direction
-    // and it lies in the first partition onward.  Otherwise, it is bounded by
-    // the positive halfspace given by the lower_token.
-    int first_partition = 0;
-    if (lower_token > 0) {
-      for (int i = 0; i < surfs_.size(); ++i) {
-        if (lower_token == surfs_[i] + 1) {
-          first_partition = i + 1;
-          break;
-        }
-      }
-    }
+  int axis = 0;
+  if (centroid_max.y - centroid_min.y > centroid_max.x - centroid_min.x)
+    axis = 1;
+  if (centroid_max.z - centroid_min.z >
+      centroid_max[axis] - centroid_min[axis])
+    axis = 2;
 
-    // Find the last partition this cell lies in.  The logic is analogous to the
-    // logic for first_partition.
-    int last_partition = surfs_.size();
-    if (upper_token < 0) {
-      for (int i = first_partition; i < surfs_.size(); ++i) {
-        if (upper_token == -(surfs_[i] + 1)) {
-          last_partition = i;
-          break;
-        }
-      }
-    }
+  const int32_t middle = begin + (end - begin) / 2;
+  std::nth_element(bounded_.begin() + begin, bounded_.begin() + middle,
+    bounded_.begin() + end, [axis](const CellBounds& a, const CellBounds& b) {
+      const double a_center =
+        a.box.min[axis] + 0.5 * (a.box.max[axis] - a.box.min[axis]);
+      const double b_center =
+        b.box.min[axis] + 0.5 * (b.box.max[axis] - b.box.min[axis]);
+      return a_center == b_center ? a.order < b.order : a_center < b_center;
+    });
 
-    // Add the cell to all relevant partitions.
-    for (int i = first_partition; i <= last_partition; ++i) {
-      partitions_[i].push_back(i_cell);
+  const int32_t left = build(begin, middle);
+  const int32_t right = build(middle, end);
+  nodes_[node_index].left = left;
+  nodes_[node_index].right = right;
+  return node_index;
+}
+
+void UniversePartitioner::query(
+  int32_t node_index, Position r, vector<CellBounds>& hits) const
+{
+  const auto& node = nodes_[node_index];
+  if (!contains(node.box, r))
+    return;
+
+  if (node.left < 0) {
+    for (int32_t i = node.begin; i < node.end; ++i) {
+      if (contains(bounded_[i].box, r))
+        hits.push_back(bounded_[i]);
     }
+  } else {
+    query(node.left, r, hits);
+    query(node.right, r, hits);
   }
 }
 
-const vector<int32_t>& UniversePartitioner::get_cells(
-  Position r, Direction u) const
+void UniversePartitioner::get_cells(Position r, vector<int32_t>& cells) const
 {
-  // Perform a binary search for the partition containing the given coordinates.
-  int left = 0;
-  int middle = (surfs_.size() - 1) / 2;
-  int right = surfs_.size() - 1;
-  while (true) {
-    // Check the sense of the coordinates for the current surface.
-    const auto& surf = *model::surfaces[surfs_[middle]];
-    if (surf.sense(r, u)) {
-      // The coordinates lie in the positive halfspace.  Recurse if there are
-      // more surfaces to check.  Otherwise, return the cells on the positive
-      // side of this surface.
-      int right_leaf = right - (right - middle) / 2;
-      if (right_leaf != middle) {
-        left = middle + 1;
-        middle = right_leaf;
-      } else {
-        return partitions_[middle + 1];
-      }
+  vector<CellBounds> hits {spill_};
+  if (!nodes_.empty())
+    query(0, r, hits);
 
-    } else {
-      // The coordinates lie in the negative halfspace.  Recurse if there are
-      // more surfaces to check.  Otherwise, return the cells on the negative
-      // side of this surface.
-      int left_leaf = left + (middle - left) / 2;
-      if (left_leaf != middle) {
-        right = middle - 1;
-        middle = left_leaf;
-      } else {
-        return partitions_[middle];
-      }
-    }
-  }
+  std::sort(hits.begin(), hits.end(),
+    [](const CellBounds& a, const CellBounds& b) { return a.order < b.order; });
+  cells.reserve(cells.size() + hits.size());
+  for (const auto& hit : hits)
+    cells.push_back(hit.cell);
 }
 
 } // namespace openmc

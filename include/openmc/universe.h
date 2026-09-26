@@ -49,32 +49,43 @@ public:
 };
 
 //==============================================================================
-//! Speeds up geometry searches by grouping cells in a search tree.
-//
-//! Currently this object only works with universes that are divided up by a
-//! bunch of z-planes.  It could be generalized to other planes, cylinders,
-//! and spheres.
+//! Speeds up geometry searches using finite cell bounding boxes.
 //==============================================================================
 
 class UniversePartitioner {
 public:
   explicit UniversePartitioner(const Universe& univ);
 
-  //! Return the list of cells that could contain the given coordinates.
-  const vector<int32_t>& get_cells(Position r, Direction u) const;
+  //! Append cells whose bounds could contain a point, in universe order.
+  void get_cells(Position r, vector<int32_t>& cells) const;
+
+  //! Whether bounded cells make candidate lookup preferable to linear search.
+  bool useful() const
+  {
+    return bounded_.size() >= 4 && bounded_.size() > spill_.size();
+  }
 
 private:
-  //! A sorted vector of indices to surfaces that partition the universe
-  vector<int32_t> surfs_;
+  struct CellBounds {
+    BoundingBox box;
+    int32_t cell;
+    int32_t order;
+  };
 
-  //! Vectors listing the indices of the cells that lie within each partition
-  //
-  //! There are n+1 partitions with n surfaces.  `partitions_.front()` gives the
-  //! cells that lie on the negative side of `surfs_.front()`.
-  //! `partitions_.back()` gives the cells that lie on the positive side of
-  //! `surfs_.back()`.  Otherwise, `partitions_[i]` gives cells sandwiched
-  //! between `surfs_[i-1]` and `surfs_[i]`.
-  vector<vector<int32_t>> partitions_;
+  struct Node {
+    BoundingBox box;
+    int32_t left {-1};
+    int32_t right {-1};
+    int32_t begin {0};
+    int32_t end {0};
+  };
+
+  int32_t build(int32_t begin, int32_t end);
+  void query(int32_t node, Position r, vector<CellBounds>& hits) const;
+
+  vector<CellBounds> bounded_;
+  vector<CellBounds> spill_;
+  vector<Node> nodes_;
 };
 
 } // namespace openmc

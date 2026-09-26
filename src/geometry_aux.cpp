@@ -16,6 +16,7 @@
 #include "openmc/geometry.h"
 #include "openmc/lattice.h"
 #include "openmc/material.h"
+#include "openmc/model/geometry/compiled_geometry.h"
 #include "openmc/settings.h"
 #include "openmc/surface.h"
 #include "openmc/tallies/filter.h"
@@ -142,35 +143,16 @@ void adjust_indices()
 }
 
 //==============================================================================
-//! Partition some universes with many z-planes for faster find_cell searches.
+//! Build cell-bound accelerators after cells contain canonical indices.
 
 void partition_universes()
 {
-  // Iterate over universes with more than 10 cells.  (Fewer than 10 is likely
-  // not worth partitioning.)
   for (const auto& univ : model::universes) {
-    if (univ->cells_.size() > 10) {
-      // Collect the set of surfaces in this universe.
-      std::unordered_set<int32_t> surf_inds;
-      for (auto i_cell : univ->cells_) {
-        for (auto token : model::cells[i_cell]->surfaces()) {
-          surf_inds.insert(std::abs(token) - 1);
-        }
-      }
-
-      // Partition the universe if there are more than 5 z-planes.  (Fewer than
-      // 5 is likely not worth it.)
-      int n_zplanes = 0;
-      for (auto i_surf : surf_inds) {
-        if (dynamic_cast<const SurfaceZPlane*>(model::surfaces[i_surf].get())) {
-          ++n_zplanes;
-          if (n_zplanes > 5) {
-            univ->partitioner_ = make_unique<UniversePartitioner>(*univ);
-            break;
-          }
-        }
-      }
-    }
+    auto partitioner = make_unique<UniversePartitioner>(*univ);
+    if (partitioner->useful())
+      univ->partitioner_ = std::move(partitioner);
+    else
+      univ->partitioner_.reset();
   }
 }
 
@@ -282,6 +264,9 @@ void finalize_geometry()
 
   // Determine number of nested coordinate levels in the geometry
   model::n_coord_levels = maximum_levels(model::root_universe);
+
+  // Publish compiled geometry only after all IDs have canonical indices.
+  model::geometry::rebuild();
 }
 
 //==============================================================================
@@ -631,6 +616,8 @@ bool is_root_universe(int32_t univ_id)
 
 void free_memory_geometry()
 {
+  model::geometry::clear();
+
   model::cells.clear();
   model::cell_map.clear();
 

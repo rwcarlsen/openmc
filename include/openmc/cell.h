@@ -123,25 +123,39 @@ private:
   //! Find the nearest intersection with any surface in the region expression.
   std::pair<double, int32_t> distance_to_nearest_surface(Position r,
     Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
-    double max_distance) const;
+    double max_distance,
+    const vector<std::size_t>* candidate_surfaces = nullptr) const;
 
   //! Find the oncoming boundary of this cell for a complex cell.
   std::pair<double, int32_t> distance_complex(
     Position r, Direction u, int32_t on_surface, bool known_inside,
-    double max_distance) const;
+    double max_distance, const vector<std::size_t>& candidate_surfaces) const;
 
   //! Exact rescan traversal used for ambiguous event groups.
   std::pair<double, int32_t> distance_complex_fallback(
     Position r, Direction u, int32_t on_surface, bool known_inside,
-    double max_distance) const;
+    double max_distance,
+    const vector<std::size_t>* candidate_surfaces = nullptr) const;
 
   //! Find a complex-region boundary when every surface has one ray crossing.
   std::pair<double, int32_t> distance_complex_planes(Position r, Direction u,
-    int32_t on_surface, bool known_inside, double max_distance) const;
+    int32_t on_surface, bool known_inside, double max_distance,
+    const vector<std::size_t>& candidate_surfaces) const;
 
   //! Evaluate one node in the compiled Boolean expression.
   bool evaluate_boolean_node(int node, Position r, Direction u,
     vector<int8_t>& values) const;
+
+  //! Collect unique surfaces in bounded Boolean branches crossed by a ray.
+  const vector<std::size_t>& candidate_surfaces(
+    Position r, Direction u, double max_distance) const;
+
+  //! Intersect a ray interval with a conservative bound.
+  bool intersect_bound(const BoundingBox& bbox, Position r, Direction u,
+    double& entry, double& exit) const;
+
+  //! Balance associative nodes in the private compiled expression tree.
+  void balance_boolean_tree();
 
   //! Set all leaves for a crossed surface and invalidate their ancestors.
   void set_surface_boolean_value(
@@ -180,6 +194,8 @@ private:
   vector<int32_t> expression_;
   //! One token per referenced surface, preserving first-expression order.
   vector<int32_t> surface_tokens_;
+  //! Conservative spatial support of each referenced surface boundary.
+  vector<BoundingBox> surface_bounds_;
   //! Closing-parenthesis index used by short-circuit operators.
   vector<std::size_t> short_circuit_jump_;
   struct BooleanNode {
@@ -188,6 +204,7 @@ private:
     int right {-1};
     int parent {-1};
     std::size_t surface {0};
+    BoundingBox bbox;
   };
   //! Compiled expression tree and leaf nodes grouped by unique surface.
   vector<BooleanNode> boolean_nodes_;

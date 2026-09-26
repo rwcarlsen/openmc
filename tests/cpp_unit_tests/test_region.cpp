@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <string>
 
 #include <pugixml.hpp>
@@ -256,6 +257,26 @@ private:
   int& sense_calls_;
 };
 
+class UnboundedCountingSphere : public CountingSphere {
+public:
+  using CountingSphere::CountingSphere;
+
+  openmc::BoundingBox bounding_box(bool) const override
+  {
+    return openmc::BoundingBox::infinite();
+  }
+};
+
+class MisboundedCountingSphere : public CountingSphere {
+public:
+  using CountingSphere::CountingSphere;
+
+  openmc::BoundingBox bounding_box(bool) const override
+  {
+    return {{10.0, 10.0, 10.0}, {11.0, 11.0, 11.0}};
+  }
+};
+
 class ScaledPlaneFixture {
 public:
   ScaledPlaneFixture()
@@ -315,6 +336,42 @@ public:
 
   std::array<int, 2> distance_calls {};
   std::array<int, 2> sense_calls {};
+};
+
+class BoundedBranchFixture {
+public:
+  static constexpr int N_SURFACES {12};
+
+  explicit BoundedBranchFixture(bool bounded = true)
+  {
+    for (int i = 0; i < N_SURFACES; ++i) {
+      pugi::xml_document doc;
+      auto sphere = doc.append_child("surface");
+      sphere.append_attribute("id") = i + 1;
+      sphere.append_attribute("type") = "sphere";
+      const std::string coefficients =
+        "0 " + std::to_string(4 * i) + " 0 1";
+      sphere.append_attribute("coeffs") = coefficients.c_str();
+      if (bounded) {
+        openmc::model::surfaces.push_back(std::make_unique<CountingSphere>(
+          sphere, distance_calls[i], sense_calls[i]));
+      } else {
+        openmc::model::surfaces.push_back(
+          std::make_unique<UnboundedCountingSphere>(
+            sphere, distance_calls[i], sense_calls[i]));
+      }
+      openmc::model::surface_map[i + 1] = i;
+    }
+  }
+
+  ~BoundedBranchFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+
+  std::array<int, N_SURFACES> distance_calls {};
+  std::array<int, N_SURFACES> sense_calls {};
 };
 
 } // anonymous namespace
@@ -587,9 +644,9 @@ TEST_CASE("Curved complex distance lazily requests successor roots")
   REQUIRE(distance == Catch::Approx(5.0));
   REQUIRE(surface == 1);
   REQUIRE(fixture.distance_calls[0] == 2);
-  REQUIRE(fixture.distance_calls[1] == 2);
+  REQUIRE(fixture.distance_calls[1] == 1);
   REQUIRE(fixture.sense_calls[0] == 0);
-  REQUIRE(fixture.sense_calls[1] == 1);
+  REQUIRE(fixture.sense_calls[1] == 0);
 }
 
 TEST_CASE("Tangent curved event preserves boundary semantics")
@@ -631,4 +688,131 @@ TEST_CASE("Coincident curved event groups use exact fallback")
   REQUIRE(surface == 1);
   REQUIRE(fixture.distance_calls[0] == 2);
   REQUIRE(fixture.distance_calls[1] == 2);
+}
+
+TEST_CASE("Compiled bounds prune disjoint distance branches")
+{
+  BoundedBranchFixture fixture;
+  openmc::Region region(
+    "-1 | -2 | -3 | -4 | -5 | -6 | -7 | -8 | -9 | -10 | -11 | -12", 0);
+
+  SECTION("Containment retains canonical evaluation order")
+  {
+    REQUIRE(region.contains({0.0, 44.0, 0.0}, {1.0, 0.0, 0.0}, 0));
+    REQUIRE(std::accumulate(
+              fixture.sense_calls.begin(), fixture.sense_calls.end(), 0) == 12);
+    REQUIRE(fixture.sense_calls.back() == 1);
+  }
+
+  SECTION("Ray intervals avoid irrelevant surface roots")
+  {
+    const auto [distance, surface] =
+      region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+    REQUIRE(distance == Catch::Approx(1.0));
+    REQUIRE(surface == 1);
+    REQUIRE(std::accumulate(fixture.distance_calls.begin(),
+              fixture.distance_calls.end(), 0) == 1);
+    REQUIRE(fixture.distance_calls.front() == 1);
+  }
+
+  SECTION("Ray intervals honor the caller distance limit")
+  {
+    const auto [distance, surface] =
+      region.distance({-2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, false, 0.5);
+    REQUIRE(distance == openmc::INFTY);
+    REQUIRE(surface == std::numeric_limits<int32_t>::max());
+    REQUIRE(std::accumulate(fixture.distance_calls.begin(),
+              fixture.distance_calls.end(), 0) == 0);
+  }
+}
+
+TEST_CASE("Intersection bounds remove impossible branch work")
+{
+  BoundedBranchFixture fixture;
+  openmc::Region region("(-2 -3) | -1", 0);
+
+  REQUIRE(region.contains({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0));
+  REQUIRE(fixture.sense_calls[1] == 1);
+  REQUIRE(fixture.sense_calls[2] == 0);
+  fixture.sense_calls = {};
+  auto [distance, surface] =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+
+  REQUIRE(distance == Catch::Approx(1.0));
+  REQUIRE(surface == 1);
+  REQUIRE(fixture.distance_calls[1] == 0);
+  REQUIRE(fixture.distance_calls[2] == 0);
+}
+
+TEST_CASE("Unbounded branches retain exact surface work")
+{
+  BoundedBranchFixture fixture;
+  openmc::Region region("1 | -2", 0);
+
+  const auto [distance, surface] =
+    region.distance({2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+
+  REQUIRE(distance == openmc::INFTY);
+  REQUIRE(surface == std::numeric_limits<int32_t>::max());
+  REQUIRE(fixture.distance_calls[0] == 1);
+}
+
+TEST_CASE("Canonical containment preserves authoritative surface sense")
+{
+  SurfaceFixture fixture;
+  openmc::Region region("(1 -2) | -3", 0);
+
+  REQUIRE(region.contains({-10.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 1));
+}
+
+TEST_CASE("Bounded candidates match canonical full-surface traversal")
+{
+  auto run = [](bool bounded) {
+    BoundedBranchFixture fixture(bounded);
+    openmc::Region region(
+      "-1 | -2 | -3 | -4 | -5 | -6 | -7 | -8 | -9 | -10 | -11 | -12", 0);
+    const auto result =
+      region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+    const int calls = std::accumulate(
+      fixture.distance_calls.begin(), fixture.distance_calls.end(), 0);
+    return std::pair {result, calls};
+  };
+
+  const auto bounded = run(true);
+  const auto canonical = run(false);
+  REQUIRE(bounded.first == canonical.first);
+  REQUIRE(bounded.second == 1);
+  REQUIRE(canonical.second == BoundedBranchFixture::N_SURFACES);
+}
+
+TEST_CASE("Missed bounds fall back to canonical surface traversal")
+{
+  struct Cleanup {
+    ~Cleanup()
+    {
+      openmc::model::surfaces.clear();
+      openmc::model::surface_map.clear();
+    }
+  } cleanup;
+  int distance_calls {0};
+  int sense_calls {0};
+  pugi::xml_document doc;
+  auto sphere = doc.append_child("surface");
+  sphere.append_attribute("id") = 1;
+  sphere.append_attribute("type") = "sphere";
+  sphere.append_attribute("coeffs") = "0 0 0 1";
+  openmc::model::surfaces.push_back(
+    std::make_unique<MisboundedCountingSphere>(
+      sphere, distance_calls, sense_calls));
+  openmc::model::surface_map[1] = 0;
+
+  {
+    openmc::Region region("-1 | -1", 0);
+    const auto [distance, surface] =
+      region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+    REQUIRE(distance == Catch::Approx(1.0));
+    REQUIRE(surface == 1);
+    REQUIRE(distance_calls == 1);
+  }
+
 }

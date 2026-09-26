@@ -418,7 +418,7 @@ void cross_lattice(GeometryState& p, const BoundaryInfo& boundary, bool verbose)
 
 //==============================================================================
 
-BoundaryInfo distance_to_boundary(GeometryState& p)
+BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
 {
   BoundaryInfo info;
   // Loop over each coordinate level.
@@ -464,7 +464,8 @@ BoundaryInfo distance_to_boundary(GeometryState& p)
     // The particle is already known to be in each cell in its coordinate
     // stack. Neither a surface beyond the lattice crossing nor one beyond a
     // boundary found at a higher level can affect the result.
-    const double distance_limit = std::min(info.distance(), d_lat);
+    const double distance_limit =
+      std::min({info.distance(), d_lat, max_distance});
     auto [d_surf, level_surf_cross] =
       c.distance(r, u, p.surface(), &p, true, distance_limit);
 

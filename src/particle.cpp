@@ -271,9 +271,6 @@ void Particle::event_calculate_xs()
 
 void Particle::event_advance()
 {
-  // Find the distance to the nearest boundary
-  boundary() = distance_to_boundary(*this);
-
   // Sample a distance to collision
   if (type() == ParticleType::electron() ||
       type() == ParticleType::positron()) {
@@ -288,6 +285,10 @@ void Particle::event_advance()
   double time_cutoff = settings::time_cutoff[type().transport_index()];
   double distance_cutoff =
     (time_cutoff < INFTY) ? (time_cutoff - time()) * speed : INFTY;
+
+  // Bound geometry work by physical events that would occur first.
+  boundary() = distance_to_boundary(
+    *this, std::min(collision_distance(), distance_cutoff));
 
   // Select smaller of the three distances
   double distance =
