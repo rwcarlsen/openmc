@@ -778,7 +778,8 @@ Region::Region(std::string region_spec, int32_t cell_id)
       if (token < OP_UNION && seen_surfaces.insert(std::abs(token)).second) {
         surface_tokens_.push_back(token);
         const Surface* surface = model::surfaces[std::abs(token) - 1].get();
-        surface_bounds_.push_back(conservative_surface_bound(*surface));
+        surface_bounds_.push_back(
+          compile_bound(conservative_surface_bound(*surface)));
         PlaneKernel kernel;
         if (const auto* plane = dynamic_cast<const SurfaceXPlane*>(surface)) {
           kernel.type = PlaneType::X;
@@ -823,9 +824,9 @@ Region::Region(std::string region_spec, int32_t cell_id)
           const int node = boolean_nodes_.size();
           const std::size_t surface = surface_positions.at(std::abs(token));
           const auto& surf = *model::surfaces[std::abs(token) - 1];
-          const BoundingBox bbox =
-            conservative_halfspace_bound(surf, token > 0);
-          boolean_nodes_.push_back({token, -1, -1, -1, surface, bbox});
+          const auto bound =
+            compile_bound(conservative_halfspace_bound(surf, token > 0));
+          boolean_nodes_.push_back({token, -1, -1, -1, surface, bound});
           surface_leaf_nodes_[surface].push_back(node);
           node_stack.push_back(node);
         } else {
@@ -835,11 +836,12 @@ Region::Region(std::string region_spec, int32_t cell_id)
           node_stack.pop_back();
           const int node = boolean_nodes_.size();
           const BoundingBox bbox = token == OP_INTERSECTION
-                                     ? boolean_nodes_[left].bbox &
-                                         boolean_nodes_[right].bbox
-                                     : boolean_nodes_[left].bbox |
-                                         boolean_nodes_[right].bbox;
-          boolean_nodes_.push_back({token, left, right, -1, 0, bbox});
+                                      ? boolean_nodes_[left].bound.box &
+                                          boolean_nodes_[right].bound.box
+                                      : boolean_nodes_[left].bound.box |
+                                          boolean_nodes_[right].bound.box;
+          boolean_nodes_.push_back(
+            {token, left, right, -1, 0, compile_bound(bbox)});
           boolean_nodes_[left].parent = node;
           boolean_nodes_[right].parent = node;
           node_stack.push_back(node);
@@ -847,6 +849,7 @@ Region::Region(std::string region_spec, int32_t cell_id)
       }
       boolean_root_ = node_stack.back();
       balance_boolean_tree();
+      compile_boolean_metadata();
     }
 
     short_circuit_jump_.assign(expression_.size(), expression_.size());
@@ -905,11 +908,12 @@ void Region::balance_boolean_tree()
     const int right = join(operands, middle, end, token);
     const int node = boolean_nodes_.size();
     const BoundingBox bbox = token == OP_INTERSECTION
-                               ? boolean_nodes_[left].bbox &
-                                   boolean_nodes_[right].bbox
-                               : boolean_nodes_[left].bbox |
-                                   boolean_nodes_[right].bbox;
-    boolean_nodes_.push_back({token, left, right, -1, 0, bbox});
+                               ? boolean_nodes_[left].bound.box &
+                                   boolean_nodes_[right].bound.box
+                               : boolean_nodes_[left].bound.box |
+                                   boolean_nodes_[right].bound.box;
+    boolean_nodes_.push_back(
+      {token, left, right, -1, 0, compile_bound(bbox)});
     boolean_nodes_[left].parent = node;
     boolean_nodes_[right].parent = node;
     return node;
@@ -919,7 +923,7 @@ void Region::balance_boolean_tree()
     if (item.token < OP_UNION) {
       const int node = boolean_nodes_.size();
       boolean_nodes_.push_back(
-        {item.token, -1, -1, -1, item.surface, item.bbox});
+        {item.token, -1, -1, -1, item.surface, item.bound});
       surface_leaf_nodes_[item.surface].push_back(node);
       return node;
     }
@@ -929,6 +933,51 @@ void Region::balance_boolean_tree()
     return join(operands, 0, operands.size(), item.token);
   };
   boolean_root_ = rebuild(boolean_root_);
+}
+
+//==============================================================================
+
+void Region::compile_boolean_metadata()
+{
+  candidate_traversal_.clear();
+  candidate_escape_.clear();
+  candidate_test_bound_.clear();
+  candidate_traversal_.reserve(boolean_nodes_.size());
+  candidate_escape_.reserve(boolean_nodes_.size());
+  candidate_test_bound_.reserve(boolean_nodes_.size());
+
+  std::function<void(int, bool)> append;
+  append = [&](int node, bool test_bound) {
+    const std::size_t position = candidate_traversal_.size();
+    candidate_traversal_.push_back(node);
+    candidate_escape_.push_back(0);
+    candidate_test_bound_.push_back(test_bound);
+    const auto& item = boolean_nodes_[node];
+    if (item.token >= OP_UNION) {
+      const bool test_children = item.token == OP_UNION;
+      append(item.left, test_children);
+      append(item.right, test_children);
+    }
+    candidate_escape_[position] = candidate_traversal_.size();
+  };
+  append(boolean_root_, false);
+
+  surface_ancestor_nodes_.clear();
+  surface_ancestor_nodes_.resize(surface_leaf_nodes_.size());
+  vector<uint32_t> marks(boolean_nodes_.size(), 0);
+  uint32_t epoch {0};
+  for (std::size_t surface = 0; surface < surface_leaf_nodes_.size(); ++surface) {
+    ++epoch;
+    for (int leaf : surface_leaf_nodes_[surface]) {
+      for (int parent = boolean_nodes_[leaf].parent; parent >= 0;
+           parent = boolean_nodes_[parent].parent) {
+        if (marks[parent] != epoch) {
+          marks[parent] = epoch;
+          surface_ancestor_nodes_[surface].push_back(parent);
+        }
+      }
+    }
+  }
 }
 
 //==============================================================================
@@ -1274,7 +1323,7 @@ std::pair<double, int32_t> Region::distance_complex(
   if (on_surface != 0) {
     for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
       if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
-        set_surface_boolean_value(i, on_surface > 0, boolean_values);
+        set_surface_boolean_value(i, on_surface > 0, boolean_values, false);
         break;
       }
     }
@@ -1393,7 +1442,7 @@ bool Region::evaluate_boolean_node(
     const bool sense = plane_kernels_[item.surface].type != PlaneType::NONE
                          ? plane_sense(item.surface, r, u)
                          : model::surfaces[std::abs(item.token) - 1]->sense(r, u);
-    set_surface_boolean_value(item.surface, sense, values);
+    set_surface_boolean_value(item.surface, sense, values, false);
     value = values[node];
   } else if (item.token == OP_INTERSECTION) {
     value = evaluate_boolean_node(item.left, r, u, values) &&
@@ -1411,23 +1460,15 @@ bool Region::evaluate_boolean_node(
 const vector<std::size_t>& Region::candidate_surfaces(
   Position r, Direction u, double max_distance) const
 {
-  struct WorkItem {
-    int node;
-    double entry;
-    double exit;
-  };
   struct Scratch {
     vector<std::size_t> candidates;
-    vector<WorkItem> stack;
     vector<uint32_t> marks;
     uint32_t epoch {0};
   };
   static thread_local Scratch scratch;
 
   scratch.candidates.clear();
-  scratch.stack.clear();
   scratch.candidates.reserve(surface_tokens_.size());
-  scratch.stack.reserve(boolean_nodes_.size());
   if (scratch.marks.size() < surface_tokens_.size())
     scratch.marks.resize(surface_tokens_.size(), 0);
   if (++scratch.epoch == 0) {
@@ -1435,83 +1476,95 @@ const vector<std::size_t>& Region::candidate_surfaces(
     ++scratch.epoch;
   }
 
+  RaySlabData ray {r, {}, 0, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    if (std::isnan(r[axis]) || std::isnan(u[axis])) {
+      ray.invalid = true;
+    } else if (u[axis] == 0.0) {
+      ray.parallel_axes |= 1 << axis;
+      ray.inverse[axis] = 0.0;
+    } else {
+      ray.inverse[axis] = 1.0 / u[axis];
+    }
+  }
+
   double entry {0.0};
   double exit {max_distance};
-  if (!intersect_bound(boolean_nodes_[boolean_root_].bbox, r, u, entry, exit))
+  if (!intersect_bound(
+        boolean_nodes_[boolean_root_].bound, ray, entry, exit))
     return scratch.candidates;
-  scratch.stack.push_back({boolean_root_, entry, exit});
 
-  while (!scratch.stack.empty()) {
-    const WorkItem work = scratch.stack.back();
-    scratch.stack.pop_back();
-    const auto& node = boolean_nodes_[work.node];
+  std::size_t cursor {0};
+  while (cursor < candidate_traversal_.size()) {
+    const int node_index = candidate_traversal_[cursor];
+    const auto& node = boolean_nodes_[node_index];
+    if (candidate_test_bound_[cursor]) {
+      double node_entry {entry};
+      double node_exit {exit};
+      if (!intersect_bound(node.bound, ray, node_entry, node_exit)) {
+        cursor = candidate_escape_[cursor];
+        continue;
+      }
+    }
+
     if (node.token < OP_UNION) {
-      double surface_entry {work.entry};
-      double surface_exit {work.exit};
-      if (intersect_bound(surface_bounds_[node.surface], r, u, surface_entry,
-            surface_exit) &&
+      double surface_entry {entry};
+      double surface_exit {exit};
+      if (intersect_bound(
+            surface_bounds_[node.surface], ray, surface_entry, surface_exit) &&
           scratch.marks[node.surface] != scratch.epoch) {
         scratch.marks[node.surface] = scratch.epoch;
         scratch.candidates.push_back(node.surface);
       }
-    } else if (node.token == OP_INTERSECTION) {
-      scratch.stack.push_back({node.right, work.entry, work.exit});
-      scratch.stack.push_back({node.left, work.entry, work.exit});
-    } else {
-      double child_entry {work.entry};
-      double child_exit {work.exit};
-      if (intersect_bound(boolean_nodes_[node.right].bbox, r, u, child_entry,
-            child_exit)) {
-        scratch.stack.push_back({node.right, child_entry, child_exit});
-      }
-      child_entry = work.entry;
-      child_exit = work.exit;
-      if (intersect_bound(boolean_nodes_[node.left].bbox, r, u, child_entry,
-            child_exit)) {
-        scratch.stack.push_back({node.left, child_entry, child_exit});
-      }
     }
+    ++cursor;
   }
   return scratch.candidates;
 }
 
 //==============================================================================
 
-bool Region::intersect_bound(const BoundingBox& bbox, Position r, Direction u,
-  double& entry, double& exit) const
+Region::RayBound Region::compile_bound(const BoundingBox& bbox)
 {
-  if (bbox.min.x == -INFTY && bbox.min.y == -INFTY &&
-      bbox.min.z == -INFTY && bbox.max.x == INFTY &&
-      bbox.max.y == INFTY && bbox.max.z == INFTY)
-    return true;
-
-  // Check parallel slabs first. Disjoint union branches are commonly rejected
-  // here without any divisions.
+  RayBound bound {bbox};
   for (int axis = 0; axis < 3; ++axis) {
     const double lower = bbox.min[axis];
     const double upper = bbox.max[axis];
-    if (lower <= -INFTY && upper >= INFTY)
-      continue;
-    if (std::isnan(r[axis]) || std::isnan(u[axis]) || std::isnan(lower) ||
-        std::isnan(upper))
-      return true;
-    if (lower > upper)
-      return false;
-    if (u[axis] == 0.0) {
-      if (r[axis] < lower || r[axis] > upper)
-        return false;
+    if (std::isnan(lower) || std::isnan(upper)) {
+      bound.invalid = true;
+    } else if (lower > upper) {
+      bound.empty = true;
+    } else if (lower > -INFTY || upper < INFTY) {
+      bound.active_axes |= 1 << axis;
     }
   }
+  return bound;
+}
+
+//==============================================================================
+
+bool Region::intersect_bound(const RayBound& bound, const RaySlabData& ray,
+  double& entry, double& exit)
+{
+  if (bound.invalid || ray.invalid)
+    return true;
+  if (bound.empty)
+    return false;
 
   for (int axis = 0; axis < 3; ++axis) {
-    const double lower = bbox.min[axis];
-    const double upper = bbox.max[axis];
-    if (lower <= -INFTY && upper >= INFTY)
+    const uint8_t bit = 1 << axis;
+    if (!(bound.active_axes & bit))
       continue;
-    if (u[axis] == 0.0)
+    const double lower = bound.box.min[axis];
+    const double upper = bound.box.max[axis];
+    if (ray.parallel_axes & bit) {
+      if (ray.origin[axis] < lower || ray.origin[axis] > upper)
+        return false;
       continue;
-    double axis_entry = (lower - r[axis]) / u[axis];
-    double axis_exit = (upper - r[axis]) / u[axis];
+    }
+    double axis_entry =
+      (lower - ray.origin[axis]) * ray.inverse[axis];
+    double axis_exit = (upper - ray.origin[axis]) * ray.inverse[axis];
     if (axis_entry > axis_exit)
       std::swap(axis_entry, axis_exit);
     entry = std::max(entry, axis_entry);
@@ -1525,15 +1578,15 @@ bool Region::intersect_bound(const BoundingBox& bbox, Position r, Direction u,
 //==============================================================================
 
 void Region::set_surface_boolean_value(
-  std::size_t surface, bool positive_side, vector<int8_t>& values) const
+  std::size_t surface, bool positive_side, vector<int8_t>& values,
+  bool invalidate) const
 {
   for (int leaf : surface_leaf_nodes_[surface]) {
     values[leaf] = positive_side == (boolean_nodes_[leaf].token > 0);
-    for (int parent = boolean_nodes_[leaf].parent; parent >= 0;
-         parent = boolean_nodes_[parent].parent) {
-      values[parent] = -1;
-    }
   }
+  if (invalidate)
+    for (int node : surface_ancestor_nodes_[surface])
+      values[node] = -1;
 }
 
 //==============================================================================
@@ -1659,7 +1712,7 @@ std::pair<double, int32_t> Region::distance_complex_planes(Position r,
   if (on_surface != 0) {
     for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
       if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
-        set_surface_boolean_value(i, on_surface > 0, boolean_values);
+        set_surface_boolean_value(i, on_surface > 0, boolean_values, false);
         break;
       }
     }

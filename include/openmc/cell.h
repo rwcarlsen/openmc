@@ -150,16 +150,36 @@ private:
   const vector<std::size_t>& candidate_surfaces(
     Position r, Direction u, double max_distance) const;
 
+  struct RayBound {
+    BoundingBox box;
+    uint8_t active_axes {0};
+    bool empty {false};
+    bool invalid {false};
+  };
+  struct RaySlabData {
+    Position origin;
+    Direction inverse;
+    uint8_t parallel_axes {0};
+    bool invalid {false};
+  };
+
+  //! Compile reusable metadata for a conservative spatial bound.
+  static RayBound compile_bound(const BoundingBox& bbox);
+
   //! Intersect a ray interval with a conservative bound.
-  bool intersect_bound(const BoundingBox& bbox, Position r, Direction u,
-    double& entry, double& exit) const;
+  static bool intersect_bound(const RayBound& bound, const RaySlabData& ray,
+    double& entry, double& exit);
 
   //! Balance associative nodes in the private compiled expression tree.
   void balance_boolean_tree();
 
+  //! Build stackless traversal and Boolean invalidation metadata.
+  void compile_boolean_metadata();
+
   //! Set all leaves for a crossed surface and invalidate their ancestors.
   void set_surface_boolean_value(
-    std::size_t surface, bool positive_side, vector<int8_t>& values) const;
+    std::size_t surface, bool positive_side, vector<int8_t>& values,
+    bool invalidate = true) const;
 
   //! Direct distance and normal projection for a predecoded plane.
   double plane_distance(std::size_t surface, Position r, Direction u,
@@ -195,7 +215,7 @@ private:
   //! One token per referenced surface, preserving first-expression order.
   vector<int32_t> surface_tokens_;
   //! Conservative spatial support of each referenced surface boundary.
-  vector<BoundingBox> surface_bounds_;
+  vector<RayBound> surface_bounds_;
   //! Closing-parenthesis index used by short-circuit operators.
   vector<std::size_t> short_circuit_jump_;
   struct BooleanNode {
@@ -204,11 +224,16 @@ private:
     int right {-1};
     int parent {-1};
     std::size_t surface {0};
-    BoundingBox bbox;
+    RayBound bound;
   };
   //! Compiled expression tree and leaf nodes grouped by unique surface.
   vector<BooleanNode> boolean_nodes_;
   vector<vector<int>> surface_leaf_nodes_;
+  vector<vector<int>> surface_ancestor_nodes_;
+  //! Pre-order node sequence, subtree escape indices, and bound-test flags.
+  vector<int> candidate_traversal_;
+  vector<int> candidate_escape_;
+  vector<uint8_t> candidate_test_bound_;
   int boolean_root_ {-1};
   enum class PlaneType : uint8_t { NONE, X, Y, Z, GENERAL };
   struct PlaneKernel {
