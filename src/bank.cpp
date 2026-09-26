@@ -3,14 +3,23 @@
 #include "openmc/error.h"
 #include "openmc/ifp.h"
 #include "openmc/message_passing.h"
+#include "openmc/openmp_interface.h"
 #include "openmc/simulation.h"
 #include "openmc/vector.h"
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <numeric>
 
 namespace openmc {
+
+namespace {
+
+vector<vector<SourceSite>> thread_fission_banks;
+std::atomic<int64_t> fission_bank_reservations {0};
+
+}
 
 //==============================================================================
 // Global variables
@@ -70,12 +79,90 @@ void free_memory_bank()
   simulation::ifp_fission_lifetime_bank.clear();
   simulation::shared_secondary_bank_read.clear();
   simulation::shared_secondary_bank_write.clear();
+  thread_fission_banks.clear();
+  fission_bank_reservations.store(0, std::memory_order_relaxed);
 }
 
 void init_fission_bank(int64_t max)
 {
   simulation::fission_bank.reserve(max);
   simulation::progeny_per_particle.resize(simulation::work_per_rank);
+  thread_fission_banks.resize(num_threads());
+}
+
+void initialize_fission_bank_generation()
+{
+  simulation::fission_bank.resize(0);
+  fission_bank_reservations.store(0, std::memory_order_relaxed);
+  if (!settings::ifp_on) {
+    if (thread_fission_banks.size() < num_threads()) {
+      thread_fission_banks.resize(num_threads());
+    }
+    for (auto& bank : thread_fission_banks) {
+      bank.clear();
+    }
+  }
+}
+
+int64_t bank_fission_site(const SourceSite& site)
+{
+  if (settings::ifp_on) {
+    return simulation::fission_bank.thread_safe_append(site);
+  }
+
+  int64_t idx = fission_bank_reservations.load(std::memory_order_relaxed);
+  while (idx < simulation::fission_bank.capacity()) {
+    if (fission_bank_reservations.compare_exchange_weak(idx, idx + 1,
+          std::memory_order_relaxed, std::memory_order_relaxed)) {
+      thread_fission_banks[thread_num()].push_back(site);
+      return idx;
+    }
+  }
+
+  return -1;
+}
+
+void collect_fission_banks()
+{
+  if (settings::ifp_on) {
+    return;
+  }
+
+  int64_t n_sites = 0;
+  for (const auto& bank : thread_fission_banks) {
+    n_sites += bank.size();
+  }
+
+  int64_t n_progeny = std::accumulate(simulation::progeny_per_particle.begin(),
+    simulation::progeny_per_particle.end(), int64_t {0});
+  if (n_sites != n_progeny ||
+      n_sites != fission_bank_reservations.load(std::memory_order_relaxed)) {
+    fatal_error("Mismatch detected between sum of all particle progeny and "
+                "thread-local fission bank size during collection.");
+  }
+
+  simulation::fission_bank.resize(n_sites);
+
+  vector<int64_t> offsets(simulation::progeny_per_particle.size());
+  std::exclusive_scan(simulation::progeny_per_particle.begin(),
+    simulation::progeny_per_particle.end(), offsets.begin(), int64_t {0});
+
+  for (const auto& bank : thread_fission_banks) {
+    for (const auto& site : bank) {
+      if (site.parent_id < 0 ||
+          site.parent_id >= static_cast<int64_t>(offsets.size())) {
+        fatal_error(fmt::format("Invalid parent_id {} for banked site "
+                                "(expected range [0, {})).",
+          site.parent_id, offsets.size()));
+      }
+      int64_t idx = offsets[site.parent_id] + site.progeny_id;
+      if (idx < 0 || idx >= n_sites) {
+        fatal_error("Invalid progeny_id detected while collecting "
+                    "thread-local fission banks.");
+      }
+      simulation::fission_bank[idx] = site;
+    }
+  }
 }
 
 // Performs an O(n) sort on a fission or secondary bank, by leveraging

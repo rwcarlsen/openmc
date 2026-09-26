@@ -45,6 +45,21 @@
 #include <numeric>
 #include <string>
 
+namespace {
+
+// History-based workers retain their Particle allocations between generations.
+// Simulation finalization clears these because their buffers are model-sized.
+openmc::vector<openmc::Particle> history_particle_workspaces;
+
+void ensure_history_particle_workspaces()
+{
+  if (history_particle_workspaces.size() < openmc::num_threads()) {
+    history_particle_workspaces.resize(openmc::num_threads());
+  }
+}
+
+} // namespace
+
 //==============================================================================
 // C API functions
 //==============================================================================
@@ -186,6 +201,7 @@ int openmc_simulation_finalize()
   for (auto& mat : model::materials) {
     mat->mat_nuclide_index_.clear();
   }
+  history_particle_workspaces.clear();
 
   // Close track file if open
   if (!settings::track_identifiers.empty() || settings::write_all_tracks) {
@@ -626,7 +642,7 @@ void initialize_generation()
 {
   if (settings::run_mode == RunMode::EIGENVALUE) {
     // Clear out the fission bank
-    simulation::fission_bank.resize(0);
+    initialize_fission_bank_generation();
 
     // Count source sites if using uniform fission source weighting
     if (settings::ufs_on)
@@ -640,6 +656,9 @@ void initialize_generation()
 
 void finalize_generation()
 {
+  // Combine scores in a fixed thread order at each transport boundary.
+  reduce_thread_tallies();
+
   auto& gt = simulation::global_tallies;
 
   // Update global tallies with the accumulation variables
@@ -662,10 +681,14 @@ void finalize_generation()
 
   if (settings::run_mode == RunMode::EIGENVALUE &&
       settings::solver_type == SolverType::MONTE_CARLO) {
-    // If using shared memory, stable sort the fission bank (by parent IDs)
-    // so as to allow for reproducibility regardless of which order particles
-    // are run in.
-    sort_bank(simulation::fission_bank, true);
+    collect_fission_banks();
+
+    // The IFP path retains atomic appends, so restore source order while moving
+    // companion data with each site. The thread-local path is merged directly
+    // into this order by collect_fission_banks().
+    if (settings::ifp_on) {
+      sort_bank(simulation::fission_bank, true);
+    }
 
     // Distribute fission bank across processors evenly
     synchronize_bank();
@@ -953,9 +976,21 @@ void free_memory_simulation()
 {
   simulation::k_generation.clear();
   simulation::entropy.clear();
+  history_particle_workspaces.clear();
 }
 
-void transport_history_based_single_particle(Particle& p)
+void accumulate_history_contributions(
+  const HistoryContributions& contributions)
+{
+  global_tally_absorption += contributions.k_absorption;
+  global_tally_collision += contributions.k_collision;
+  global_tally_tracklength += contributions.k_tracklength;
+  global_tally_leakage += contributions.leakage;
+  simulation::simulation_tracks_completed += contributions.tracks;
+}
+
+void transport_history_based_single_particle(
+  Particle& p, HistoryContributions& contributions)
 {
   while (p.alive()) {
     p.event_calculate_xs();
@@ -971,19 +1006,27 @@ void transport_history_based_single_particle(Particle& p)
     }
     p.event_check_limit_and_revive();
   }
-  p.event_death();
+  p.event_death(contributions);
 }
 
 void transport_history_based()
 {
+  ensure_history_particle_workspaces();
+  vector<HistoryContributions> contributions(num_threads());
 #pragma omp parallel
   {
-    Particle p;
+    int tid = thread_num();
+    auto& p = history_particle_workspaces[tid];
+    HistoryContributions local_contributions;
 #pragma omp for schedule(runtime)
     for (int64_t i_work = 1; i_work <= simulation::work_per_rank; ++i_work) {
       initialize_particle_track(p, i_work, false);
-      transport_history_based_single_particle(p);
+      transport_history_based_single_particle(p, local_contributions);
     }
+    contributions[tid] = local_contributions;
+  }
+  for (const auto& contribution : contributions) {
+    accumulate_history_contributions(contribution);
   }
 }
 
@@ -997,6 +1040,8 @@ void transport_history_based()
 // continues until there are no more secondary tracks left to transport.
 void transport_history_based_shared_secondary()
 {
+  ensure_history_particle_workspaces();
+
   // Clear shared secondary banks from any prior use
   simulation::shared_secondary_bank_read.clear();
   simulation::shared_secondary_bank_write.clear();
@@ -1012,23 +1057,30 @@ void transport_history_based_shared_secondary()
     simulation::progeny_per_particle.end(), 0);
 
   vector<vector<SourceSite>> thread_banks(num_threads());
+  vector<HistoryContributions> contributions(num_threads());
 
   // Phase 1: Transport primary particles and deposit first generation of
   // secondaries in the shared secondary bank
 #pragma omp parallel
   {
-    auto& thread_bank = thread_banks[thread_num()];
-    Particle p;
+    int tid = thread_num();
+    auto& thread_bank = thread_banks[tid];
+    auto& p = history_particle_workspaces[tid];
+    HistoryContributions local_contributions;
 
 #pragma omp for schedule(runtime)
     for (int64_t i = 1; i <= simulation::work_per_rank; i++) {
       initialize_particle_track(p, i, false);
-      transport_history_based_single_particle(p);
+      transport_history_based_single_particle(p, local_contributions);
       for (auto& site : p.local_secondary_bank()) {
         thread_bank.push_back(site);
       }
       p.local_secondary_bank().clear();
     }
+    contributions[tid] = local_contributions;
+  }
+  for (const auto& contribution : contributions) {
+    accumulate_history_contributions(contribution);
   }
   collect_sorted_history_secondary_banks(thread_banks);
   thread_banks.clear();
@@ -1070,12 +1122,15 @@ void transport_history_based_shared_secondary()
     std::fill(simulation::progeny_per_particle.begin(),
       simulation::progeny_per_particle.end(), 0);
     thread_banks.resize(num_threads());
+    std::fill(contributions.begin(), contributions.end(), HistoryContributions {});
 
     // Transport all secondary tracks from the shared secondary bank
 #pragma omp parallel
     {
-      auto& thread_bank = thread_banks[thread_num()];
-      Particle p;
+      int tid = thread_num();
+      auto& thread_bank = thread_banks[tid];
+      auto& p = history_particle_workspaces[tid];
+      HistoryContributions local_contributions;
 
 #pragma omp for schedule(runtime)
       for (int64_t i = 1; i <= simulation::shared_secondary_bank_read.size();
@@ -1083,13 +1138,17 @@ void transport_history_based_shared_secondary()
         initialize_particle_track(p, i, true);
         SourceSite& site = simulation::shared_secondary_bank_read[i - 1];
         p.event_revive_from_secondary(site);
-        transport_history_based_single_particle(p);
+        transport_history_based_single_particle(p, local_contributions);
         for (auto& secondary_site : p.local_secondary_bank()) {
           thread_bank.push_back(secondary_site);
         }
         p.local_secondary_bank().clear();
       }
+      contributions[tid] = local_contributions;
     } // End of transport loop over tracks in shared secondary bank
+    for (const auto& contribution : contributions) {
+      accumulate_history_contributions(contribution);
+    }
     simulation::shared_secondary_bank_write =
       std::move(simulation::shared_secondary_bank_read);
     simulation::shared_secondary_bank_read = SharedArray<SourceSite>();

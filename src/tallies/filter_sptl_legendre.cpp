@@ -78,11 +78,11 @@ void SpatialLegendreFilter::get_all_bins(
     double x_norm = 2.0 * (x - min_) / (max_ - min_) - 1.0;
 
     // Compute and return the Legendre weights.
-    vector<double> wgt(order_ + 1);
-    calc_pn_c(order_, x_norm, wgt.data());
+    auto offset = match.weights_.size();
+    match.weights_.resize(offset + n_bins_);
+    calc_pn_c(order_, x_norm, match.weights_.data() + offset);
     for (int i = 0; i < order_ + 1; i++) {
       match.bins_.push_back(i);
-      match.weights_.push_back(wgt[i]);
     }
   }
 }

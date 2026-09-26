@@ -3,6 +3,7 @@
 #include "openmc/bank.h"
 #include "openmc/error.h"
 #include "openmc/material.h"
+#include "openmc/openmp_interface.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
 #include "openmc/timer.h"
@@ -172,10 +173,20 @@ void process_collision_events()
 void process_death_events(int64_t n_particles)
 {
   simulation::time_event_death.start();
-#pragma omp parallel for schedule(runtime)
-  for (int64_t i = 0; i < n_particles; i++) {
-    Particle& p = simulation::particles[i];
-    p.event_death();
+  vector<HistoryContributions> contributions(num_threads());
+#pragma omp parallel
+  {
+    int tid = thread_num();
+    HistoryContributions local_contributions;
+#pragma omp for schedule(runtime)
+    for (int64_t i = 0; i < n_particles; i++) {
+      Particle& p = simulation::particles[i];
+      p.event_death(local_contributions);
+    }
+    contributions[tid] = local_contributions;
+  }
+  for (const auto& contribution : contributions) {
+    accumulate_history_contributions(contribution);
   }
   simulation::time_event_death.stop();
 }

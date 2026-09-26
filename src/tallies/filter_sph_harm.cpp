@@ -1,5 +1,6 @@
 #include "openmc/tallies/filter_sph_harm.h"
 
+#include <array>
 #include <cassert>
 #include <utility> // For pair
 
@@ -50,7 +51,7 @@ void SphericalHarmonicsFilter::get_all_bins(
   const Particle& p, TallyEstimator estimator, FilterMatch& match) const
 {
   // Determine cosine term for scatter expansion if necessary
-  vector<double> wgt(order_ + 1);
+  std::array<double, 11> wgt;
   if (cosine_ == SphericalHarmonicsCosine::scatter) {
     calc_pn_c(order_, p.mu(), wgt.data());
   } else {
@@ -60,8 +61,9 @@ void SphericalHarmonicsFilter::get_all_bins(
   }
 
   // Find the Rn,m values
-  vector<double> rn(n_bins_);
-  calc_rn(order_, p.u_last(), rn.data());
+  auto offset = match.weights_.size();
+  match.weights_.resize(offset + n_bins_);
+  calc_rn(order_, p.u_last(), match.weights_.data() + offset);
 
   int j = 0;
   for (int n = 0; n < order_ + 1; n++) {
@@ -70,7 +72,7 @@ void SphericalHarmonicsFilter::get_all_bins(
 
     // Append the matching (bin,weight) for each moment
     for (int i = 0; i < num_nm; i++) {
-      match.weights_.push_back(wgt[n] * rn[j]);
+      match.weights_[offset + j] *= wgt[n];
       match.bins_.push_back(j);
       ++j;
     }

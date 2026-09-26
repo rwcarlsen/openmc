@@ -37,11 +37,11 @@ void ZernikeFilter::get_all_bins(
 
   if (r <= 1.0) {
     // Compute and return the Zernike weights.
-    vector<double> zn(n_bins_);
-    calc_zn(order_, r, theta, zn.data());
+    auto offset = match.weights_.size();
+    match.weights_.resize(offset + n_bins_);
+    calc_zn(order_, r, theta, match.weights_.data() + offset);
     for (int i = 0; i < n_bins_; i++) {
       match.bins_.push_back(i);
-      match.weights_.push_back(zn[i]);
     }
   }
 }
@@ -92,11 +92,11 @@ void ZernikeRadialFilter::get_all_bins(
 
   if (r <= 1.0) {
     // Compute and return the Zernike weights.
-    vector<double> zn(n_bins_);
-    calc_zn_rad(order_, r, zn.data());
+    auto offset = match.weights_.size();
+    match.weights_.resize(offset + n_bins_);
+    calc_zn_rad(order_, r, match.weights_.data() + offset);
     for (int i = 0; i < n_bins_; i++) {
       match.bins_.push_back(i);
-      match.weights_.push_back(zn[i]);
     }
   }
 }

@@ -92,10 +92,11 @@ int openmc_init(int argc, char* argv[], const void* intracomm)
   simulation::time_initialize.start();
 
 #ifdef _OPENMP
-  // If OMP_SCHEDULE is not set, default to a static schedule
+  // If OMP_SCHEDULE is not set, balance histories dynamically. Explicit
+  // runtime schedules continue to take precedence.
   char* envvar = std::getenv("OMP_SCHEDULE");
   if (!envvar) {
-    omp_set_schedule(omp_sched_static, 0);
+    omp_set_schedule(omp_sched_dynamic, 1);
   }
 #endif
 

@@ -1,5 +1,7 @@
 #include "openmc/geometry.h"
 
+#include <algorithm>
+
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 
@@ -419,22 +421,14 @@ void cross_lattice(GeometryState& p, const BoundaryInfo& boundary, bool verbose)
 BoundaryInfo distance_to_boundary(GeometryState& p)
 {
   BoundaryInfo info;
-  double d_lat = INFINITY;
-  double d_surf = INFINITY;
-  int32_t level_surf_cross;
-  array<int, 3> level_lat_trans {};
-
   // Loop over each coordinate level.
   for (int i = 0; i < p.n_coord(); i++) {
     const auto& coord {p.coord(i)};
     const Position& r {coord.r()};
     const Direction& u {coord.u()};
     Cell& c {*model::cells[coord.cell()]};
-
-    // Find the oncoming surface in this cell and the distance to it.
-    auto surface_distance = c.distance(r, u, p.surface(), &p);
-    d_surf = surface_distance.first;
-    level_surf_cross = surface_distance.second;
+    double d_lat = INFINITY;
+    array<int, 3> level_lat_trans {};
 
     // Find the distance to the next lattice tile crossing.
     if (coord.lattice() != C_NONE) {
@@ -467,6 +461,13 @@ BoundaryInfo distance_to_boundary(GeometryState& p)
       }
     }
 
+    // The particle is already known to be in each cell in its coordinate
+    // stack. Neither a surface beyond the lattice crossing nor one beyond a
+    // boundary found at a higher level can affect the result.
+    const double distance_limit = std::min(info.distance(), d_lat);
+    auto [d_surf, level_surf_cross] =
+      c.distance(r, u, p.surface(), &p, true, distance_limit);
+
     // If the boundary on this coordinate level is coincident with a boundary on
     // a higher level then we need to make sure that the higher level boundary
     // is selected.  This logic must consider floating point precision.
@@ -476,22 +477,8 @@ BoundaryInfo distance_to_boundary(GeometryState& p)
         // Update closest distance
         d = d_surf;
 
-        // If the cell is not simple, it is possible that both the negative and
-        // positive half-space were given in the region specification. Thus, we
-        // have to explicitly check which half-space the particle would be
-        // traveling into if the surface is crossed
-        if (c.is_simple() || d == INFTY) {
-          info.surface() = level_surf_cross;
-        } else {
-          Position r_hit = r + d_surf * u;
-          Surface& surf {*model::surfaces[std::abs(level_surf_cross) - 1]};
-          Direction norm = surf.normal(r_hit);
-          if (u.dot(norm) > 0) {
-            info.surface() = std::abs(level_surf_cross);
-          } else {
-            info.surface() = -std::abs(level_surf_cross);
-          }
-        }
+        // Region distance already reports the half-space entered at crossing.
+        info.surface() = level_surf_cross;
 
         info.lattice_translation()[0] = 0;
         info.lattice_translation()[1] = 0;

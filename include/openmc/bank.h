@@ -49,6 +49,17 @@ void free_memory_bank();
 
 void init_fission_bank(int64_t max);
 
+//! Prepare shared and thread-local fission banks for a new generation.
+void initialize_fission_bank_generation();
+
+//! Bank one fission site, using thread-local storage when IFP is disabled.
+//!
+//! \return Reserved bank index, or -1 if the shared bank is full.
+int64_t bank_fission_site(const SourceSite& site);
+
+//! Deterministically merge thread-local fission sites into the shared bank.
+void collect_fission_banks();
+
 int64_t synchronize_global_secondary_bank(
   SharedArray<SourceSite>& shared_secondary_bank);
 

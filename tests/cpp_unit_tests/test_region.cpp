@@ -4,6 +4,11 @@
 #include "openmc/cell.h"
 #include "openmc/surface.h"
 
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <string>
+
 #include <pugixml.hpp>
 
 namespace {
@@ -98,6 +103,218 @@ public:
     openmc::model::surfaces.clear();
     openmc::model::surface_map.clear();
   }
+};
+
+class CountingXPlane : public openmc::SurfaceXPlane {
+public:
+  CountingXPlane(pugi::xml_node node, int& distance_calls, int& sense_calls)
+    : SurfaceXPlane {node}, distance_calls_ {distance_calls},
+      sense_calls_ {sense_calls}
+  {}
+
+  double evaluate(openmc::Position r) const override
+  {
+    ++sense_calls_;
+    return SurfaceXPlane::evaluate(r);
+  }
+
+  double distance(openmc::Position r, openmc::Direction u,
+    bool coincident) const override
+  {
+    ++distance_calls_;
+    return SurfaceXPlane::distance(r, u, coincident);
+  }
+
+private:
+  int& distance_calls_;
+  int& sense_calls_;
+};
+
+template<class Plane>
+class CountingKernelPlane : public Plane {
+public:
+  CountingKernelPlane(
+    pugi::xml_node node, int& distance_calls, int& normal_calls, int& sense_calls)
+    : Plane {node}, distance_calls_ {distance_calls},
+      normal_calls_ {normal_calls}, sense_calls_ {sense_calls}
+  {}
+
+  double evaluate(openmc::Position r) const override
+  {
+    ++sense_calls_;
+    return Plane::evaluate(r);
+  }
+
+  double distance(openmc::Position r, openmc::Direction u,
+    bool coincident) const override
+  {
+    ++distance_calls_;
+    return Plane::distance(r, u, coincident);
+  }
+
+  openmc::Direction normal(openmc::Position r) const override
+  {
+    ++normal_calls_;
+    return Plane::normal(r);
+  }
+
+private:
+  int& distance_calls_;
+  int& normal_calls_;
+  int& sense_calls_;
+};
+
+class PlaneKernelFixture {
+public:
+  PlaneKernelFixture(const char* type, const char* coefficients)
+  {
+    pugi::xml_document doc;
+    auto plane = doc.append_child("surface");
+    plane.append_attribute("id") = 1;
+    plane.append_attribute("type") = type;
+    plane.append_attribute("coeffs") = coefficients;
+    const std::string plane_type {type};
+    if (plane_type == "x-plane") {
+      openmc::model::surfaces.push_back(
+        std::make_unique<CountingKernelPlane<openmc::SurfaceXPlane>>(
+          plane, distance_calls, normal_calls, sense_calls));
+    } else if (plane_type == "y-plane") {
+      openmc::model::surfaces.push_back(
+        std::make_unique<CountingKernelPlane<openmc::SurfaceYPlane>>(
+          plane, distance_calls, normal_calls, sense_calls));
+    } else if (plane_type == "z-plane") {
+      openmc::model::surfaces.push_back(
+        std::make_unique<CountingKernelPlane<openmc::SurfaceZPlane>>(
+          plane, distance_calls, normal_calls, sense_calls));
+    } else {
+      openmc::model::surfaces.push_back(
+        std::make_unique<CountingKernelPlane<openmc::SurfacePlane>>(
+          plane, distance_calls, normal_calls, sense_calls));
+    }
+    openmc::model::surface_map[1] = 0;
+  }
+
+  ~PlaneKernelFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+
+  int distance_calls {0};
+  int normal_calls {0};
+  int sense_calls {0};
+};
+
+class CountingPlaneFixture {
+public:
+  CountingPlaneFixture()
+  {
+    for (int i = 0; i < 3; ++i) {
+      pugi::xml_document doc;
+      auto node = doc.append_child("surface");
+      node.append_attribute("id") = i + 1;
+      node.append_attribute("type") = "x-plane";
+      node.append_attribute("coeffs") = i + 1;
+      openmc::model::surfaces.push_back(std::make_unique<CountingXPlane>(
+        node, distance_calls[i], sense_calls[i]));
+      openmc::model::surface_map[i + 1] = i;
+    }
+  }
+
+  ~CountingPlaneFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+
+  std::array<int, 3> distance_calls {};
+  std::array<int, 3> sense_calls {};
+};
+
+class CountingSphere : public openmc::SurfaceSphere {
+public:
+  CountingSphere(pugi::xml_node node, int& distance_calls, int& sense_calls)
+    : SurfaceSphere {node}, distance_calls_ {distance_calls},
+      sense_calls_ {sense_calls}
+  {}
+
+  double evaluate(openmc::Position r) const override
+  {
+    ++sense_calls_;
+    return SurfaceSphere::evaluate(r);
+  }
+
+  double distance(openmc::Position r, openmc::Direction u,
+    bool coincident) const override
+  {
+    ++distance_calls_;
+    return SurfaceSphere::distance(r, u, coincident);
+  }
+
+private:
+  int& distance_calls_;
+  int& sense_calls_;
+};
+
+class ScaledPlaneFixture {
+public:
+  ScaledPlaneFixture()
+  {
+    pugi::xml_document doc;
+    auto plane = doc.append_child("surface");
+    plane.append_attribute("id") = 1;
+    plane.append_attribute("type") = "plane";
+    plane.append_attribute("coeffs") = "1000000 0 0 0";
+    openmc::model::surfaces.push_back(
+      std::make_unique<openmc::SurfacePlane>(plane));
+    openmc::model::surface_map[1] = 0;
+  }
+
+  ~ScaledPlaneFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+};
+
+class CurvedEventFixture {
+public:
+  explicit CurvedEventFixture(bool coincident_spheres = false)
+  {
+    pugi::xml_document doc;
+    auto sphere = doc.append_child("surface");
+    sphere.append_attribute("id") = 1;
+    sphere.append_attribute("type") = "sphere";
+    sphere.append_attribute("coeffs") =
+      coincident_spheres ? "0 0 0 1" : "5 0 0 1";
+    openmc::model::surfaces.push_back(std::make_unique<CountingSphere>(
+      sphere, distance_calls[0], sense_calls[0]));
+    openmc::model::surface_map[1] = 0;
+
+    auto second = doc.append_child("surface");
+    second.append_attribute("id") = 2;
+    if (coincident_spheres) {
+      second.append_attribute("type") = "sphere";
+      second.append_attribute("coeffs") = "0 0 0 1";
+      openmc::model::surfaces.push_back(std::make_unique<CountingSphere>(
+        second, distance_calls[1], sense_calls[1]));
+    } else {
+      second.append_attribute("type") = "x-plane";
+      second.append_attribute("coeffs") = 5;
+      openmc::model::surfaces.push_back(std::make_unique<CountingXPlane>(
+        second, distance_calls[1], sense_calls[1]));
+    }
+    openmc::model::surface_map[2] = 1;
+  }
+
+  ~CurvedEventFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+
+  std::array<int, 2> distance_calls {};
+  std::array<int, 2> sense_calls {};
 };
 
 } // anonymous namespace
@@ -222,4 +439,196 @@ TEST_CASE("Ignore roundoff-scale virtual surface crossings")
 
   REQUIRE(distance == Catch::Approx(603.9161175466262));
   REQUIRE(surface == 1);
+}
+
+TEST_CASE("Predecode unique region surfaces")
+{
+  CountingPlaneFixture fixture;
+  openmc::Region region("-1 | -1", 0);
+
+  auto [distance, surface] =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+
+  REQUIRE(distance == Catch::Approx(1.0));
+  REQUIRE(surface == 1);
+  REQUIRE(fixture.distance_calls[0] == 0);
+}
+
+TEST_CASE("Plane-only complex distance precomputes roots")
+{
+  CountingPlaneFixture fixture;
+  openmc::Region region("-1 | -2", 0);
+
+  auto [distance, surface] =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+
+  REQUIRE(distance == Catch::Approx(2.0));
+  REQUIRE(surface == 2);
+  REQUIRE(fixture.distance_calls[0] == 0);
+  REQUIRE(fixture.distance_calls[1] == 0);
+  REQUIRE(fixture.sense_calls[0] + fixture.sense_calls[1] == 0);
+}
+
+TEST_CASE("Known-inside complex distance skips initial membership test")
+{
+  CountingPlaneFixture fixture;
+  openmc::Region region("-1 | -2", 0);
+
+  const auto known_inside =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+  fixture.sense_calls = {};
+
+  const auto default_result =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(default_result == known_inside);
+  REQUIRE(fixture.sense_calls[0] + fixture.sense_calls[1] == 0);
+}
+
+TEST_CASE("Complex contains short circuits parenthesized branches")
+{
+  CountingPlaneFixture fixture;
+  openmc::Region region("(-1 | -2) -3", 0);
+
+  REQUIRE(region.contains({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0));
+  REQUIRE(fixture.sense_calls[0] == 1);
+  REQUIRE(fixture.sense_calls[1] == 0);
+  REQUIRE(fixture.sense_calls[2] == 1);
+}
+
+TEST_CASE("Complex distance honors an upper bound")
+{
+  CountingPlaneFixture fixture;
+  openmc::Region region("-1 | -2", 0);
+
+  auto [distance, surface] = region.distance(
+    {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true, 0.5);
+
+  REQUIRE(distance == openmc::INFTY);
+  REQUIRE(surface == std::numeric_limits<int32_t>::max());
+}
+
+TEST_CASE("Initial nearby plane crossing is not suppressed")
+{
+  ScaledPlaneFixture fixture;
+  openmc::Region region("-1 | -1", 0);
+
+  auto [distance, surface] =
+    region.distance({-5.0e-13, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(distance == Catch::Approx(5.0e-13));
+  REQUIRE(distance < openmc::FP_COINCIDENT);
+  REQUIRE(surface == 1);
+}
+
+TEST_CASE("Predecoded plane kernels match virtual surface methods")
+{
+  auto check = [](const char* type, const char* coefficients,
+                 openmc::Position r, openmc::Direction u,
+                 int32_t on_surface = 0) {
+    PlaneKernelFixture fixture(type, coefficients);
+    openmc::Region region("-1 | -1", 0);
+    const auto& plane = *openmc::model::surfaces[0];
+    const bool coincident = std::abs(on_surface) == 1;
+    const double expected_distance = plane.distance(r, u, coincident);
+    int32_t expected_surface = std::numeric_limits<int32_t>::max();
+    if (expected_distance != openmc::INFTY) {
+      const auto r_hit = r + expected_distance * u;
+      expected_surface = u.dot(plane.normal(r_hit)) > 0.0 ? 1 : -1;
+    }
+    const int distance_calls = fixture.distance_calls;
+    const int normal_calls = fixture.normal_calls;
+    const int sense_calls = fixture.sense_calls;
+
+    const auto [distance, surface] = region.distance(r, u, on_surface);
+
+    REQUIRE(distance == expected_distance);
+    REQUIRE(surface == expected_surface);
+    REQUIRE(fixture.distance_calls == distance_calls);
+    REQUIRE(fixture.normal_calls == normal_calls);
+    REQUIRE(fixture.sense_calls == sense_calls);
+  };
+
+  SECTION("X plane")
+  {
+    check("x-plane", "1", {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0});
+  }
+  SECTION("Y plane")
+  {
+    check("y-plane", "2", {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
+  }
+  SECTION("Z plane")
+  {
+    check("z-plane", "-1", {0.0, 0.0, 0.0}, {0.0, -1.0, 0.0});
+  }
+  SECTION("General plane")
+  {
+    check("plane", "1 2 3 4", {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0});
+  }
+  SECTION("Coincident plane")
+  {
+    check("x-plane", "1", {1.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, -1);
+  }
+  SECTION("Near-parallel general plane")
+  {
+    check("plane", "1 0 0 0", {-1.0e-3, 0.0, 0.0},
+      {1.0e-12, 1.0, 0.0});
+  }
+}
+
+TEST_CASE("Curved complex distance lazily requests successor roots")
+{
+  CurvedEventFixture fixture;
+  openmc::Region region("-2 | -1", 0);
+
+  auto [distance, surface] =
+    region.distance({1.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(distance == Catch::Approx(5.0));
+  REQUIRE(surface == 1);
+  REQUIRE(fixture.distance_calls[0] == 2);
+  REQUIRE(fixture.distance_calls[1] == 2);
+  REQUIRE(fixture.sense_calls[0] == 0);
+  REQUIRE(fixture.sense_calls[1] == 1);
+}
+
+TEST_CASE("Tangent curved event preserves boundary semantics")
+{
+  CurvedEventFixture fixture;
+  openmc::Region region("-1 | -1", 0);
+
+  auto [distance, surface] =
+    region.distance({3.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(distance == Catch::Approx(2.0));
+  REQUIRE(surface == -1);
+  REQUIRE(fixture.distance_calls[0] == 2);
+}
+
+TEST_CASE("Repeated curved surfaces share distance and sense caches")
+{
+  CurvedEventFixture fixture;
+  openmc::Region region("-1 | -1", 0);
+
+  auto [distance, surface] =
+    region.distance({3.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(distance == Catch::Approx(1.0));
+  REQUIRE(surface == -1);
+  REQUIRE(fixture.distance_calls[0] == 1);
+  REQUIRE(fixture.sense_calls[0] == 1);
+}
+
+TEST_CASE("Coincident curved event groups use exact fallback")
+{
+  CurvedEventFixture fixture(true);
+  openmc::Region region("-1 | -2", 0);
+
+  auto [distance, surface] =
+    region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+
+  REQUIRE(distance == Catch::Approx(1.0));
+  REQUIRE(surface == 1);
+  REQUIRE(fixture.distance_calls[0] == 2);
+  REQUIRE(fixture.distance_calls[1] == 2);
 }

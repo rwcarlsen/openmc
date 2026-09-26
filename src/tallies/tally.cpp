@@ -11,6 +11,7 @@
 #include "openmc/message_passing.h"
 #include "openmc/mgxs_interface.h"
 #include "openmc/nuclide.h"
+#include "openmc/openmp_interface.h"
 #include "openmc/particle.h"
 #include "openmc/reaction.h"
 #include "openmc/reaction_product.h"
@@ -46,6 +47,15 @@
 #include <string>
 
 namespace openmc {
+
+namespace {
+
+// Keep private storage bounded both by tally size and by total bytes per tally.
+// Tallies outside either limit retain the atomic scoring path.
+constexpr size_t MAX_PRIVATE_TALLY_ELEMENTS = 4'096;
+constexpr size_t MAX_PRIVATE_TALLY_BYTES = 64 * 1024 * 1024;
+
+} // namespace
 
 //==============================================================================
 // Global variable definitions
@@ -846,6 +856,17 @@ void Tally::init_results()
     results_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
       static_cast<size_t>(n_scores), size_t {3}});
   }
+
+  private_results_ = {};
+  const size_t n_values = static_cast<size_t>(n_filter_bins_) * n_scores;
+  const size_t n_threads = num_threads();
+  if (settings::solver_type == SolverType::MONTE_CARLO &&
+      n_values <= MAX_PRIVATE_TALLY_ELEMENTS && n_threads > 0 &&
+      n_values <= MAX_PRIVATE_TALLY_BYTES / (n_threads * sizeof(double))) {
+    private_results_ = tensor::Tensor<double>(
+      {n_threads, static_cast<size_t>(n_filter_bins_),
+        static_cast<size_t>(n_scores)});
+  }
 }
 
 void Tally::reset()
@@ -853,6 +874,40 @@ void Tally::reset()
   n_realizations_ = 0;
   if (results_.size() != 0) {
     results_.fill(0.0);
+  }
+  if (private_results_.size() != 0) {
+    private_results_.fill(0.0);
+  }
+}
+
+void Tally::add_score(int64_t filter_index, int score_index, double score)
+{
+  int i_thread = thread_num();
+  if (private_results_.size() != 0 &&
+      static_cast<size_t>(i_thread) < private_results_.shape(0)) {
+    private_results_(i_thread, filter_index, score_index) += score;
+  } else {
+#pragma omp atomic
+    results_(filter_index, score_index, TallyResult::VALUE) += score;
+  }
+}
+
+void Tally::reduce_thread_results()
+{
+  if (private_results_.size() == 0)
+    return;
+
+#pragma omp parallel for
+  for (int64_t i = 0; i < results_.shape(0); ++i) {
+    for (int j = 0; j < results_.shape(1); ++j) {
+      double value = results_(i, j, TallyResult::VALUE);
+      for (size_t i_thread = 0; i_thread < private_results_.shape(0);
+           ++i_thread) {
+        value += private_results_(i_thread, i, j);
+        private_results_(i_thread, i, j) = 0.0;
+      }
+      results_(i, j, TallyResult::VALUE) = value;
+    }
   }
 }
 
@@ -1096,6 +1151,9 @@ void reduce_tally_results()
 
 void accumulate_tallies()
 {
+  // Ensure all local scores are visible before MPI reduction and statistics.
+  reduce_thread_tallies();
+
 #ifdef OPENMC_MPI
   // Combine tally results onto master process
   if (mpi::n_procs > 1 && settings::solver_type == SolverType::MONTE_CARLO) {
@@ -1138,6 +1196,13 @@ void accumulate_tallies()
   for (int i_tally : model::active_tallies) {
     auto& tally {model::tallies[i_tally]};
     tally->accumulate();
+  }
+}
+
+void reduce_thread_tallies()
+{
+  for (int i_tally : model::active_tallies) {
+    model::tallies[i_tally]->reduce_thread_results();
   }
 }
 

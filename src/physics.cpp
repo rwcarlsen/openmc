@@ -234,7 +234,7 @@ void create_fission_sites(Particle& p, int i_nuclide, const Reaction& rx)
 
     // Store fission site in bank
     if (use_fission_bank) {
-      int64_t idx = simulation::fission_bank.thread_safe_append(site);
+      int64_t idx = bank_fission_site(site);
       if (idx == -1) {
         warning(
           "The shared fission bank is full. Additional fission sites created "

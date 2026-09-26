@@ -20,6 +20,15 @@ namespace openmc {
 // Forward declare the Surface class for use in Particle::cross_vacuum_bc, etc.
 class Surface;
 
+//! Per-worker contributions accumulated while particle histories are retired.
+struct HistoryContributions {
+  double k_absorption {0.0};
+  double k_collision {0.0};
+  double k_tracklength {0.0};
+  double leakage {0.0};
+  int64_t tracks {0};
+};
+
 /*
  * The Particle class encompasses data and methods for transporting particles
  * through their lifecycle. Its base class defines particle data layout in
@@ -73,7 +82,7 @@ public:
   void event_collide();
   void event_revive_from_secondary(const SourceSite& site);
   void event_check_limit_and_revive();
-  void event_death();
+  void event_death(HistoryContributions& contributions);
 
   //! pulse-height recording
   void pht_collision_energy();

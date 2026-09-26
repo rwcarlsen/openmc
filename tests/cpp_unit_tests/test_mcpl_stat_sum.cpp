@@ -5,6 +5,8 @@
 
 #include "openmc/bank.h"
 #include "openmc/mcpl_interface.h"
+#include "openmc/settings.h"
+#include "openmc/simulation.h"
 
 // Test the MCPL stat:sum functionality (issue #3514)
 TEST_CASE("MCPL stat:sum field")
@@ -105,4 +107,78 @@ TEST_CASE("MCPL stat:sum field")
     // Clean up
     std::remove(filename.c_str());
   }
+}
+
+TEST_CASE("Thread-local fission banks merge deterministically")
+{
+  openmc::settings::ifp_on = false;
+  openmc::simulation::work_per_rank = 3;
+  openmc::init_fission_bank(6);
+  openmc::initialize_fission_bank_generation();
+  openmc::simulation::progeny_per_particle = {2, 2, 2};
+
+  // Deliberately stage sites in reverse source order. The merge must restore
+  // parent/progeny ordering.
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int j = 0; j < 6; ++j) {
+    int i = 5 - j;
+    openmc::SourceSite site;
+    site.parent_id = i / 2;
+    site.progeny_id = i % 2;
+    site.E = i;
+    openmc::bank_fission_site(site);
+  }
+
+  openmc::collect_fission_banks();
+
+  REQUIRE(openmc::simulation::fission_bank.size() == 6);
+  for (int i = 0; i < 6; ++i) {
+    REQUIRE(openmc::simulation::fission_bank[i].E == i);
+  }
+  openmc::vector<int64_t> expected_counts {2, 2, 2};
+  REQUIRE(openmc::simulation::progeny_per_particle == expected_counts);
+
+  openmc::free_memory_bank();
+}
+
+TEST_CASE("Thread-local fission bank reports overflow immediately")
+{
+  openmc::settings::ifp_on = false;
+  openmc::simulation::work_per_rank = 1;
+  openmc::init_fission_bank(2);
+  openmc::initialize_fission_bank_generation();
+
+  openmc::SourceSite site;
+  site.parent_id = 0;
+  site.progeny_id = 0;
+  REQUIRE(openmc::bank_fission_site(site) == 0);
+  site.progeny_id = 1;
+  REQUIRE(openmc::bank_fission_site(site) == 1);
+  site.progeny_id = 2;
+  REQUIRE(openmc::bank_fission_site(site) == -1);
+
+  // The caller only counts successful appends, as create_fission_sites does.
+  openmc::simulation::progeny_per_particle = {2};
+  openmc::collect_fission_banks();
+  REQUIRE(openmc::simulation::fission_bank.size() == 2);
+
+  openmc::free_memory_bank();
+}
+
+TEST_CASE("IFP fission banking retains shared append indices")
+{
+  openmc::settings::ifp_on = true;
+  openmc::simulation::work_per_rank = 1;
+  openmc::init_fission_bank(2);
+  openmc::initialize_fission_bank_generation();
+
+  openmc::SourceSite site;
+  REQUIRE(openmc::bank_fission_site(site) == 0);
+  REQUIRE(openmc::bank_fission_site(site) == 1);
+  REQUIRE(openmc::bank_fission_site(site) == -1);
+  openmc::collect_fission_banks();
+  REQUIRE(openmc::simulation::fission_bank.size() == 2);
+
+  openmc::settings::ifp_on = false;
+  openmc::free_memory_bank();
 }

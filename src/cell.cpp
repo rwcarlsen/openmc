@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <iterator>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -706,6 +707,94 @@ Region::Region(std::string region_spec, int32_t cell_id)
     }
     expression_.shrink_to_fit();
 
+    // Distance calculations only depend on the geometric surface, not how many
+    // times or with which sense it appears in the Boolean expression.
+    std::unordered_set<int32_t> seen_surfaces;
+    for (int32_t token : expression_) {
+      if (token < OP_UNION && seen_surfaces.insert(std::abs(token)).second) {
+        surface_tokens_.push_back(token);
+        const Surface* surface = model::surfaces[std::abs(token) - 1].get();
+        PlaneKernel kernel;
+        if (const auto* plane = dynamic_cast<const SurfaceXPlane*>(surface)) {
+          kernel.type = PlaneType::X;
+          kernel.coefficients[0] = plane->x0_;
+        } else if (const auto* plane =
+                    dynamic_cast<const SurfaceYPlane*>(surface)) {
+          kernel.type = PlaneType::Y;
+          kernel.coefficients[0] = plane->y0_;
+        } else if (const auto* plane =
+                    dynamic_cast<const SurfaceZPlane*>(surface)) {
+          kernel.type = PlaneType::Z;
+          kernel.coefficients[0] = plane->z0_;
+        } else if (const auto* plane =
+                    dynamic_cast<const SurfacePlane*>(surface)) {
+          kernel.type = PlaneType::GENERAL;
+          kernel.coefficients[0] = plane->A_;
+          kernel.coefficients[1] = plane->B_;
+          kernel.coefficients[2] = plane->C_;
+          kernel.coefficients[3] = plane->D_;
+        } else {
+          all_surfaces_are_planes_ = false;
+        }
+        plane_kernels_.push_back(kernel);
+      }
+    }
+    surface_tokens_.shrink_to_fit();
+    if (simple_ || !all_surfaces_are_planes_) {
+      plane_kernels_.clear();
+    }
+    plane_kernels_.shrink_to_fit();
+
+    if (!simple_) {
+      std::unordered_map<int32_t, std::size_t> surface_positions;
+      surface_leaf_nodes_.resize(surface_tokens_.size());
+      for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+        surface_positions[std::abs(surface_tokens_[i])] = i;
+      }
+
+      vector<int> node_stack;
+      for (int32_t token : generate_postfix(cell_id)) {
+        if (token < OP_UNION) {
+          const int node = boolean_nodes_.size();
+          const std::size_t surface = surface_positions.at(std::abs(token));
+          boolean_nodes_.push_back({token, -1, -1, -1, surface});
+          surface_leaf_nodes_[surface].push_back(node);
+          node_stack.push_back(node);
+        } else {
+          const int right = node_stack.back();
+          node_stack.pop_back();
+          const int left = node_stack.back();
+          node_stack.pop_back();
+          const int node = boolean_nodes_.size();
+          boolean_nodes_.push_back({token, left, right});
+          boolean_nodes_[left].parent = node;
+          boolean_nodes_[right].parent = node;
+          node_stack.push_back(node);
+        }
+      }
+      boolean_root_ = node_stack.back();
+    }
+
+    // Record the closing parenthesis for every operator in a parenthesized
+    // expression. This turns each runtime short-circuit scan into one lookup.
+    short_circuit_jump_.assign(expression_.size(), expression_.size());
+    vector<vector<std::size_t>> operators_by_depth;
+    for (std::size_t i = 0; i < expression_.size(); ++i) {
+      if (expression_[i] == OP_LEFT_PAREN) {
+        operators_by_depth.emplace_back();
+      } else if ((expression_[i] == OP_UNION ||
+                   expression_[i] == OP_INTERSECTION) &&
+                 !operators_by_depth.empty()) {
+        operators_by_depth.back().push_back(i);
+      } else if (expression_[i] == OP_RIGHT_PAREN &&
+                 !operators_by_depth.empty()) {
+        for (std::size_t op : operators_by_depth.back()) {
+          short_circuit_jump_[op] = i;
+        }
+        operators_by_depth.pop_back();
+      }
+    }
+
   } else {
     simple_ = true;
   }
@@ -948,28 +1037,34 @@ std::string Region::str() const
 //==============================================================================
 
 std::pair<double, int32_t> Region::distance(
-  Position r, Direction u, int32_t on_surface) const
+  Position r, Direction u, int32_t on_surface, bool known_inside,
+  double max_distance) const
 {
   if (simple_) {
-    return distance_to_nearest_surface(r, u, on_surface, false);
+    return distance_to_nearest_surface(
+      r, u, on_surface, false, max_distance);
+  } else if (all_surfaces_are_planes_) {
+    return distance_complex_planes(
+      r, u, on_surface, known_inside, max_distance);
+  } else if (surface_tokens_.size() <= 8 || surface_tokens_.size() >= 512) {
+    // Queue setup pays off for tiny or very large mixed-surface expressions.
+    return distance_complex(r, u, on_surface, known_inside, max_distance);
   } else {
-    return distance_complex(r, u, on_surface);
+    return distance_complex_fallback(
+      r, u, on_surface, known_inside, max_distance);
   }
 }
 
 //==============================================================================
 
 std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
-  Direction u, int32_t on_surface, bool ignore_coincident_surfaces) const
+  Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
+  double max_distance) const
 {
   double min_dist {INFTY};
   int32_t i_surf {std::numeric_limits<int32_t>::max()};
 
-  for (int32_t token : expression_) {
-    // Ignore this token if it corresponds to an operator rather than a region.
-    if (token >= OP_UNION)
-      continue;
-
+  for (int32_t token : surface_tokens_) {
     // Calculate the distance to this surface.
     // Note the off-by-one indexing
     bool coincident {std::abs(token) == std::abs(on_surface)};
@@ -980,6 +1075,8 @@ std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
     // with other surfaces at the same location to avoid repeatedly crossing
     // between them due to roundoff.
     if (ignore_coincident_surfaces && d < FP_COINCIDENT)
+      continue;
+    if (d >= max_distance)
       continue;
 
     // Check if this distance is the new minimum.
@@ -997,14 +1094,108 @@ std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
 //==============================================================================
 
 std::pair<double, int32_t> Region::distance_complex(
-  Position r, Direction u, int32_t on_surface) const
+  Position r, Direction u, int32_t on_surface, bool known_inside,
+  double max_distance) const
 {
-  const bool in_region = contains_complex(r, u, on_surface);
+  struct SurfaceEvent {
+    double distance;
+    std::size_t surface;
+  };
+  struct EventCompare {
+    bool operator()(const SurfaceEvent& a, const SurfaceEvent& b) const
+    {
+      return a.distance > b.distance ||
+             (a.distance == b.distance && a.surface > b.surface);
+    }
+  };
+
+  std::priority_queue<SurfaceEvent, vector<SurfaceEvent>, EventCompare> events;
+  for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+    const int32_t token = surface_tokens_[i];
+    const bool coincident {std::abs(token) == std::abs(on_surface)};
+    const double distance =
+      model::surfaces[std::abs(token) - 1]->distance(r, u, coincident);
+    if ((on_surface == 0 || distance >= FP_COINCIDENT) &&
+        distance < max_distance) {
+      events.push({distance, i});
+    }
+  }
+
+  vector<int8_t> boolean_values(boolean_nodes_.size(), -1);
+  if (on_surface != 0) {
+    for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+      if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
+        set_surface_boolean_value(i, on_surface > 0, boolean_values);
+        break;
+      }
+    }
+  }
+  const bool in_region = known_inside ||
+                         evaluate_boolean_node(
+                           boolean_root_, r, u, boolean_values);
+
+  while (!events.empty()) {
+    const SurfaceEvent event = events.top();
+    events.pop();
+
+    // Near-simultaneous roots can depend on expression order and on_surface
+    // tie-breaking. Preserve those cases with the exact rescan traversal.
+    if (!events.empty()) {
+      const double next = events.top().distance;
+      const double tolerance = std::max(FP_COINCIDENT,
+        FP_PRECISION * std::max(std::abs(event.distance), std::abs(next)));
+      if (next - event.distance < tolerance) {
+        return distance_complex_fallback(
+          r, u, on_surface, known_inside, max_distance);
+      }
+    }
+
+    const int32_t token = surface_tokens_[event.surface];
+    int32_t i_surf = std::abs(token);
+    const Position r_hit = r + event.distance * u;
+    const auto& surf {*model::surfaces[i_surf - 1]};
+    const Direction normal = surf.normal(r_hit);
+    const double normal_projection = u.dot(normal);
+    if (std::abs(normal_projection) <= FP_PRECISION * normal.norm()) {
+      return distance_complex_fallback(
+        r, u, on_surface, known_inside, max_distance);
+    }
+    if (normal_projection < 0.0) {
+      i_surf = -i_surf;
+    }
+
+    set_surface_boolean_value(event.surface, i_surf > 0, boolean_values);
+    if (evaluate_boolean_node(boolean_root_, r, u, boolean_values) !=
+        in_region) {
+      return {event.distance, i_surf};
+    }
+
+    const double next = surf.distance(r_hit, u, true);
+    if (next < FP_COINCIDENT) {
+      return distance_complex_fallback(
+        r, u, on_surface, known_inside, max_distance);
+    }
+    if (next < INFTY - event.distance &&
+        next + event.distance < max_distance) {
+      events.push({event.distance + next, event.surface});
+    }
+  }
+
+  return {INFTY, std::numeric_limits<int32_t>::max()};
+}
+
+//==============================================================================
+
+std::pair<double, int32_t> Region::distance_complex_fallback(
+  Position r, Direction u, int32_t on_surface, bool known_inside,
+  double max_distance) const
+{
+  const bool in_region = known_inside || contains_complex(r, u, on_surface);
   double total_distance {0.0};
 
   while (true) {
-    auto [distance, i_surf] =
-      distance_to_nearest_surface(r, u, on_surface, on_surface != 0);
+    auto [distance, i_surf] = distance_to_nearest_surface(r, u, on_surface,
+      on_surface != 0, max_distance - total_distance);
     if (distance == INFTY) {
       return {INFTY, std::numeric_limits<int32_t>::max()};
     }
@@ -1027,6 +1218,224 @@ std::pair<double, int32_t> Region::distance_complex(
       return {total_distance, i_surf};
     }
     on_surface = i_surf;
+  }
+}
+
+//==============================================================================
+
+bool Region::evaluate_boolean_node(
+  int node, Position r, Direction u, vector<int8_t>& values) const
+{
+  if (values[node] >= 0) {
+    return values[node];
+  }
+
+  const auto& item = boolean_nodes_[node];
+  bool value;
+  if (item.token < OP_UNION) {
+    const bool sense = all_surfaces_are_planes_
+                         ? plane_sense(item.surface, r, u)
+                         : model::surfaces[std::abs(item.token) - 1]->sense(r, u);
+    set_surface_boolean_value(item.surface, sense, values);
+    value = values[node];
+  } else if (item.token == OP_INTERSECTION) {
+    value = evaluate_boolean_node(item.left, r, u, values) &&
+            evaluate_boolean_node(item.right, r, u, values);
+  } else {
+    value = evaluate_boolean_node(item.left, r, u, values) ||
+            evaluate_boolean_node(item.right, r, u, values);
+  }
+  values[node] = value;
+  return value;
+}
+
+//==============================================================================
+
+void Region::set_surface_boolean_value(
+  std::size_t surface, bool positive_side, vector<int8_t>& values) const
+{
+  for (int leaf : surface_leaf_nodes_[surface]) {
+    values[leaf] = positive_side == (boolean_nodes_[leaf].token > 0);
+    for (int parent = boolean_nodes_[leaf].parent; parent >= 0;
+         parent = boolean_nodes_[parent].parent) {
+      values[parent] = -1;
+    }
+  }
+}
+
+//==============================================================================
+
+double Region::plane_distance(std::size_t surface, Position r, Direction u,
+  bool coincident) const
+{
+  const auto& plane = plane_kernels_[surface];
+  double f;
+  double projection;
+  switch (plane.type) {
+  case PlaneType::X:
+    f = plane.coefficients[0] - r.x;
+    projection = u.x;
+    break;
+  case PlaneType::Y:
+    f = plane.coefficients[0] - r.y;
+    projection = u.y;
+    break;
+  case PlaneType::Z:
+    f = plane.coefficients[0] - r.z;
+    projection = u.z;
+    break;
+  case PlaneType::GENERAL:
+    f = plane.coefficients[0] * r.x + plane.coefficients[1] * r.y +
+        plane.coefficients[2] * r.z - plane.coefficients[3];
+    projection = plane.coefficients[0] * u.x +
+                 plane.coefficients[1] * u.y +
+                 plane.coefficients[2] * u.z;
+    if (coincident || std::abs(f) < FP_COINCIDENT || projection == 0.0)
+      return INFTY;
+    f = -f;
+    break;
+  default:
+    return INFTY;
+  }
+
+  if (coincident || std::abs(f) < FP_COINCIDENT || projection == 0.0)
+    return INFTY;
+  const double distance = f / projection;
+  return distance < 0.0 ? INFTY : distance;
+}
+
+//==============================================================================
+
+double Region::plane_normal_projection(
+  std::size_t surface, Direction u) const
+{
+  const auto& plane = plane_kernels_[surface];
+  switch (plane.type) {
+  case PlaneType::X:
+    return u.x;
+  case PlaneType::Y:
+    return u.y;
+  case PlaneType::Z:
+    return u.z;
+  case PlaneType::GENERAL:
+    return plane.coefficients[0] * u.x + plane.coefficients[1] * u.y +
+           plane.coefficients[2] * u.z;
+  default:
+    return 0.0;
+  }
+}
+
+//==============================================================================
+
+bool Region::plane_sense(
+  std::size_t surface, Position r, Direction u) const
+{
+  const auto& plane = plane_kernels_[surface];
+  double value;
+  switch (plane.type) {
+  case PlaneType::X:
+    value = r.x - plane.coefficients[0];
+    break;
+  case PlaneType::Y:
+    value = r.y - plane.coefficients[0];
+    break;
+  case PlaneType::Z:
+    value = r.z - plane.coefficients[0];
+    break;
+  case PlaneType::GENERAL:
+    value = plane.coefficients[0] * r.x + plane.coefficients[1] * r.y +
+            plane.coefficients[2] * r.z - plane.coefficients[3];
+    break;
+  default:
+    return false;
+  }
+
+  if (std::abs(value) < FP_COINCIDENT)
+    return plane_normal_projection(surface, u) > 0.0;
+  return value > 0.0;
+}
+
+//==============================================================================
+
+std::pair<double, int32_t> Region::distance_complex_planes(Position r,
+  Direction u, int32_t on_surface, bool known_inside, double max_distance) const
+{
+  struct Crossing {
+    double distance;
+    int32_t token;
+    std::size_t surface;
+    bool used;
+  };
+
+  vector<Crossing> crossings;
+  crossings.reserve(surface_tokens_.size());
+  for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+    const int32_t token = surface_tokens_[i];
+    const bool coincident {std::abs(token) == std::abs(on_surface)};
+    const double distance = plane_distance(i, r, u, coincident);
+    if ((on_surface == 0 || distance >= FP_COINCIDENT) &&
+        distance < max_distance) {
+      crossings.push_back({distance, token, i, false});
+    }
+  }
+
+  vector<int8_t> boolean_values(boolean_nodes_.size(), -1);
+  if (on_surface != 0) {
+    for (std::size_t i = 0; i < surface_tokens_.size(); ++i) {
+      if (std::abs(surface_tokens_[i]) == std::abs(on_surface)) {
+        set_surface_boolean_value(i, on_surface > 0, boolean_values);
+        break;
+      }
+    }
+  }
+  const bool in_region = known_inside ||
+                         evaluate_boolean_node(
+                           boolean_root_, r, u, boolean_values);
+  double total_distance {0.0};
+  bool ignore_coincident {on_surface != 0};
+  while (true) {
+    double min_distance {INFTY};
+    std::size_t nearest {crossings.size()};
+    for (std::size_t i = 0; i < crossings.size(); ++i) {
+      const double distance = crossings[i].distance - total_distance;
+      if (crossings[i].used ||
+          (ignore_coincident && distance < FP_COINCIDENT))
+        continue;
+      if (distance < min_distance &&
+          min_distance - distance >= FP_PRECISION * min_distance) {
+        min_distance = distance;
+        nearest = i;
+      }
+    }
+    if (nearest == crossings.size()) {
+      return {INFTY, std::numeric_limits<int32_t>::max()};
+    }
+
+    for (std::size_t i = 0; i < crossings.size(); ++i) {
+      if (i == nearest || crossings[i].used)
+        continue;
+      const double distance = crossings[i].distance - total_distance;
+      const double tolerance = std::max(FP_COINCIDENT,
+        FP_PRECISION * std::max(std::abs(min_distance), std::abs(distance)));
+      if (std::abs(distance - min_distance) < tolerance) {
+        return distance_complex_fallback(
+          r, u, on_surface, known_inside, max_distance);
+      }
+    }
+
+    crossings[nearest].used = true;
+    total_distance = crossings[nearest].distance;
+    int32_t i_surf = std::abs(crossings[nearest].token);
+    if (plane_normal_projection(crossings[nearest].surface, u) <= 0.0) {
+      i_surf = -i_surf;
+    }
+    set_surface_boolean_value(
+      crossings[nearest].surface, i_surf > 0, boolean_values);
+    if (evaluate_boolean_node(boolean_root_, r, u, boolean_values) !=
+        in_region) {
+      return {total_distance, i_surf};
+    }
+    ignore_coincident = true;
   }
 }
 
@@ -1072,8 +1481,8 @@ bool Region::contains_complex(Position r, Direction u, int32_t on_surface) const
   int total_depth = 0;
 
   // For each token
-  for (auto it = expression_.begin(); it != expression_.end(); it++) {
-    int32_t token = *it;
+  for (std::size_t i = 0; i < expression_.size(); ++i) {
+    int32_t token = expression_[i];
 
     // If the token is a surface evaluate the sense
     // If the token is a union or intersection check to
@@ -1096,24 +1505,7 @@ bool Region::contains_complex(Position r, Direction u, int32_t on_surface) const
       }
 
       total_depth--;
-
-      // While the iterator is within the bounds of the vector
-      int depth = 1;
-      do {
-        // Get next token
-        it++;
-        int32_t next_token = *it;
-
-        // If the token is an a parenthesis
-        if (next_token > OP_COMPLEMENT) {
-          // Adjust depth accordingly
-          if (next_token == OP_RIGHT_PAREN) {
-            depth--;
-          } else {
-            depth++;
-          }
-        }
-      } while (depth > 0);
+      i = short_circuit_jump_[i];
     } else if (token == OP_LEFT_PAREN) {
       total_depth++;
     } else if (token == OP_RIGHT_PAREN) {

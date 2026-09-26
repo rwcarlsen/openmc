@@ -78,3 +78,53 @@ TEST_CASE("Tally filter-bin count does not overflow 32 bits")
   REQUIRE(tally->n_filter_bins() == bins_per_filter * bins_per_filter);
   REQUIRE(tally->n_filter_bins() > 2147483647);
 }
+
+TEST_CASE("Small dense tallies use thread-private accumulation")
+{
+  Tally* tally = Tally::create();
+  tally->set_strides();
+  tally->set_scores({"flux"});
+  tally->init_results();
+  tally->results_(0, 0, TallyResult::SUM) = 3.0;
+  tally->results_(0, 0, TallyResult::SUM_SQ) = 5.0;
+
+  constexpr int n_scores = 10000;
+#pragma omp parallel for
+  for (int i = 0; i < n_scores; ++i) {
+    tally->add_score(0, 0, 1.0);
+  }
+
+  // Scores remain private until a generation or batch boundary.
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == 0.0);
+  tally->reduce_thread_results();
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == n_scores);
+  REQUIRE(tally->results()(0, 0, TallyResult::SUM) == 3.0);
+  REQUIRE(tally->results()(0, 0, TallyResult::SUM_SQ) == 5.0);
+
+  // Reduction clears the private buffers and is safe to repeat.
+  tally->reduce_thread_results();
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == n_scores);
+}
+
+TEST_CASE("Large dense tallies retain atomic accumulation")
+{
+  constexpr int n_bins = 100001;
+  std::vector<double> edges(n_bins + 1);
+  for (int i = 0; i <= n_bins; ++i)
+    edges[i] = i;
+
+  Tally* tally = Tally::create();
+  Filter* filter = Filter::create("energy");
+  dynamic_cast<EnergyFilter*>(filter)->set_bins(edges);
+  tally->add_filter(filter);
+  tally->set_strides();
+  tally->set_scores({"flux"});
+  tally->init_results();
+
+  constexpr int n_scores = 10000;
+#pragma omp parallel for
+  for (int i = 0; i < n_scores; ++i) {
+    tally->add_score(0, 0, 1.0);
+  }
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == n_scores);
+}

@@ -81,8 +81,11 @@ public:
   bool contains(Position r, Direction u, int32_t on_surface) const;
 
   //! Find the oncoming boundary of this cell.
+  //! \param known_inside Whether membership in this region is already known.
+  //! \param max_distance Ignore boundaries at or beyond this distance.
   std::pair<double, int32_t> distance(
-    Position r, Direction u, int32_t on_surface) const;
+    Position r, Direction u, int32_t on_surface, bool known_inside = false,
+    double max_distance = INFTY) const;
 
   //! Get the BoundingBox for this cell.
   BoundingBox bounding_box(int32_t cell_id) const;
@@ -119,11 +122,36 @@ private:
 
   //! Find the nearest intersection with any surface in the region expression.
   std::pair<double, int32_t> distance_to_nearest_surface(Position r,
-    Direction u, int32_t on_surface, bool ignore_coincident_surfaces) const;
+    Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
+    double max_distance) const;
 
   //! Find the oncoming boundary of this cell for a complex cell.
   std::pair<double, int32_t> distance_complex(
-    Position r, Direction u, int32_t on_surface) const;
+    Position r, Direction u, int32_t on_surface, bool known_inside,
+    double max_distance) const;
+
+  //! Exact rescan traversal used for ambiguous event groups.
+  std::pair<double, int32_t> distance_complex_fallback(
+    Position r, Direction u, int32_t on_surface, bool known_inside,
+    double max_distance) const;
+
+  //! Find a complex-region boundary when every surface has one ray crossing.
+  std::pair<double, int32_t> distance_complex_planes(Position r, Direction u,
+    int32_t on_surface, bool known_inside, double max_distance) const;
+
+  //! Evaluate one node in the compiled Boolean expression.
+  bool evaluate_boolean_node(int node, Position r, Direction u,
+    vector<int8_t>& values) const;
+
+  //! Set all leaves for a crossed surface and invalidate their ancestors.
+  void set_surface_boolean_value(
+    std::size_t surface, bool positive_side, vector<int8_t>& values) const;
+
+  //! Direct distance and normal projection for a predecoded plane.
+  double plane_distance(std::size_t surface, Position r, Direction u,
+    bool coincident) const;
+  double plane_normal_projection(std::size_t surface, Direction u) const;
+  bool plane_sense(std::size_t surface, Position r, Direction u) const;
 
   //! BoundingBox if the particle is in a simple cell.
   BoundingBox bounding_box_simple() const;
@@ -150,7 +178,30 @@ private:
   //! Definition of spatial region as Boolean expression of half-spaces
   // TODO: Should this be a vector of some other type
   vector<int32_t> expression_;
+  //! One token per referenced surface, preserving first-expression order.
+  vector<int32_t> surface_tokens_;
+  //! Closing-parenthesis index used by short-circuit operators.
+  vector<std::size_t> short_circuit_jump_;
+  struct BooleanNode {
+    int32_t token;
+    int left {-1};
+    int right {-1};
+    int parent {-1};
+    std::size_t surface {0};
+  };
+  //! Compiled expression tree and leaf nodes grouped by unique surface.
+  vector<BooleanNode> boolean_nodes_;
+  vector<vector<int>> surface_leaf_nodes_;
+  int boolean_root_ {-1};
+  enum class PlaneType : uint8_t { NONE, X, Y, Z, GENERAL };
+  struct PlaneKernel {
+    PlaneType type {PlaneType::NONE};
+    double coefficients[4] {};
+  };
+  //! Plane coefficients aligned with surface_tokens_ for direct evaluation.
+  vector<PlaneKernel> plane_kernels_;
   bool simple_; //!< Does the region contain only intersections?
+  bool all_surfaces_are_planes_ {true};
 };
 
 //==============================================================================
@@ -213,8 +264,11 @@ public:
   virtual bool contains(Position r, Direction u, int32_t on_surface) const = 0;
 
   //! Find the oncoming boundary of this cell.
+  //! \param known_inside Whether membership in this cell is already known.
+  //! \param max_distance Ignore boundaries at or beyond this distance.
   virtual std::pair<double, int32_t> distance(
-    Position r, Direction u, int32_t on_surface, GeometryState* p) const = 0;
+    Position r, Direction u, int32_t on_surface, GeometryState* p,
+    bool known_inside = false, double max_distance = INFTY) const = 0;
 
   //! Write all information needed to reconstruct the cell to an HDF5 group.
   //! \param group_id An HDF5 group id.
@@ -429,9 +483,10 @@ public:
   vector<int32_t> surfaces() const override { return region_.surfaces(); }
 
   std::pair<double, int32_t> distance(Position r, Direction u,
-    int32_t on_surface, GeometryState* p) const override
+    int32_t on_surface, GeometryState* p, bool known_inside = false,
+    double max_distance = INFTY) const override
   {
-    return region_.distance(r, u, on_surface);
+    return region_.distance(r, u, on_surface, known_inside, max_distance);
   }
 
   bool contains(Position r, Direction u, int32_t on_surface) const override

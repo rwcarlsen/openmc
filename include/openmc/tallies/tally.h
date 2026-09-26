@@ -120,6 +120,12 @@ public:
 
   void accumulate();
 
+  //! Add a score to the current realization.
+  void add_score(int64_t filter_index, int score_index, double score);
+
+  //! Fold thread-private scores into the public VALUE result column.
+  void reduce_thread_results();
+
   //! return the index of a score specified by name
   int score_index(const std::string& score) const;
 
@@ -194,6 +200,9 @@ private:
   //! Whether to accumulate higher moments (third and fourth)
   bool higher_moments_ {false};
 
+  //! Per-thread VALUE storage used for small, dense tallies.
+  tensor::Tensor<double> private_results_;
+
   int64_t index_;
 };
 
@@ -244,6 +253,9 @@ void read_tallies_xml(pugi::xml_node root);
 //! \brief Accumulate the sum of the contributions from each history within the
 //! batch to a new random variable
 void accumulate_tallies();
+
+//! Fold thread-private tally scores into each tally's VALUE column.
+void reduce_thread_tallies();
 
 //! Determine distance to next time boundary
 //

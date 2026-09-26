@@ -129,7 +129,9 @@ void run_particle_restart()
     add_particle_track(p);
 
   // Transport neutron
-  transport_history_based_single_particle(p);
+  HistoryContributions contributions;
+  transport_history_based_single_particle(p, contributions);
+  accumulate_history_contributions(contributions);
 
   // Write output if particle made it
   print_particle(p);

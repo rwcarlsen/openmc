@@ -103,6 +103,73 @@ private:
   int n_coord_levels_;
 };
 
+class CountingXPlane : public openmc::SurfaceXPlane {
+public:
+  CountingXPlane(pugi::xml_node node, int& normal_calls)
+    : SurfaceXPlane {node}, normal_calls_ {normal_calls}
+  {}
+
+  openmc::Direction normal(openmc::Position r) const override
+  {
+    ++normal_calls_;
+    return SurfaceXPlane::normal(r);
+  }
+
+private:
+  int& normal_calls_;
+};
+
+class BoundaryFixture {
+public:
+  BoundaryFixture()
+    : root_universe_ {openmc::model::root_universe},
+      n_coord_levels_ {openmc::model::n_coord_levels}
+  {
+    openmc::model::cells.clear();
+    openmc::model::cell_map.clear();
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+    openmc::model::n_coord_levels = 1;
+    openmc::model::root_universe = 0;
+
+    pugi::xml_document surface_doc;
+    auto surface_node = surface_doc.append_child("surface");
+    surface_node.append_attribute("id") = 1;
+    surface_node.append_attribute("type") = "x-plane";
+    surface_node.append_attribute("coeffs") = 1;
+    openmc::model::surfaces.push_back(
+      std::make_unique<CountingXPlane>(surface_node, normal_calls));
+    openmc::model::surface_map[1] = 0;
+
+    pugi::xml_document cell_doc;
+    auto cell_node = cell_doc.append_child("cell");
+    cell_node.append_attribute("id") = 1;
+    cell_node.append_attribute("universe") = 0;
+    cell_node.append_child("material").text() = "void";
+    cell_node.append_child("region").text() = "-1 | -1";
+    auto cell = std::make_unique<openmc::CSGCell>(cell_node);
+    cell->type_ = openmc::Fill::MATERIAL;
+    openmc::model::cells.push_back(std::move(cell));
+    openmc::model::cell_map[1] = 0;
+  }
+
+  ~BoundaryFixture()
+  {
+    openmc::model::cells.clear();
+    openmc::model::cell_map.clear();
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+    openmc::model::root_universe = root_universe_;
+    openmc::model::n_coord_levels = n_coord_levels_;
+  }
+
+  int normal_calls {0};
+
+private:
+  int root_universe_;
+  int n_coord_levels_;
+};
+
 } // namespace
 
 TEST_CASE("Reconcile a particle after a collision near a surface")
@@ -124,4 +191,19 @@ TEST_CASE("Reconcile a particle after a collision near a surface")
   REQUIRE(p.n_coord() == 2);
   REQUIRE(p.coord(0).cell() == 0);
   REQUIRE(p.coord(1).cell() == 1);
+}
+
+TEST_CASE("Distance to boundary uses the predecoded plane projection")
+{
+  BoundaryFixture fixture;
+  openmc::GeometryState p;
+  p.coord(0).cell() = 0;
+  p.coord(0).r() = {0.0, 0.0, 0.0};
+  p.coord(0).u() = {1.0, 0.0, 0.0};
+
+  const auto boundary = openmc::distance_to_boundary(p);
+
+  REQUIRE(boundary.distance() == 1.0);
+  REQUIRE(boundary.surface() == 1);
+  REQUIRE(fixture.normal_calls == 0);
 }

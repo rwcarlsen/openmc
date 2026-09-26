@@ -44,6 +44,12 @@ option(OPENMC_USE_MPI         "Enable MPI"                                      
 option(OPENMC_USE_UWUW        "Enable UWUW"                                          OFF)
 option(OPENMC_FORCE_VENDORED_LIBS "Explicitly use submodules defined in 'vendor'"    OFF)
 option(OPENMC_ENABLE_STRICT_FP "Enable strict FP flags to improve test portability"  OFF)
+option(OPENMC_ENABLE_NATIVE     "Optimize for the build host CPU architecture"       OFF)
+option(OPENMC_ENABLE_IPO        "Enable interprocedural optimization (IPO/LTO)"       OFF)
+set(OPENMC_PGO_MODE "OFF" CACHE STRING "Profile-guided optimization mode: OFF, GENERATE, or USE")
+set_property(CACHE OPENMC_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(OPENMC_PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-data" CACHE PATH
+  "Directory containing profile-guided optimization data")
 
 message(STATUS "OPENMC_USE_OPENMP ${OPENMC_USE_OPENMP}")
 message(STATUS "OPENMC_BUILD_TESTS ${OPENMC_BUILD_TESTS}")
@@ -55,6 +61,10 @@ message(STATUS "OPENMC_USE_MPI ${OPENMC_USE_MPI}")
 message(STATUS "OPENMC_USE_UWUW ${OPENMC_USE_UWUW}")
 message(STATUS "OPENMC_FORCE_VENDORED_LIBS ${OPENMC_FORCE_VENDORED_LIBS}")
 message(STATUS "OPENMC_ENABLE_STRICT_FP ${OPENMC_ENABLE_STRICT_FP}")
+message(STATUS "OPENMC_ENABLE_NATIVE ${OPENMC_ENABLE_NATIVE}")
+message(STATUS "OPENMC_ENABLE_IPO ${OPENMC_ENABLE_IPO}")
+message(STATUS "OPENMC_PGO_MODE ${OPENMC_PGO_MODE}")
+message(STATUS "OPENMC_PGO_PROFILE_DIR ${OPENMC_PGO_PROFILE_DIR}")
 
 # Warnings for deprecated options
 foreach(OLD_OPT IN ITEMS "openmp" "profile" "coverage" "dagmc" "libmesh")
@@ -229,6 +239,48 @@ endif()
 #===============================================================================
 # Set compile/link flags based on which compiler is being used
 #===============================================================================
+
+if(OPENMC_ENABLE_NATIVE)
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag(-march=native OPENMC_HAVE_MARCH_NATIVE)
+  if(NOT OPENMC_HAVE_MARCH_NATIVE)
+    message(FATAL_ERROR
+      "OPENMC_ENABLE_NATIVE requires a compiler that supports -march=native")
+  endif()
+  list(APPEND cxxflags -march=native)
+endif()
+
+if(OPENMC_ENABLE_IPO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT OPENMC_HAVE_IPO OUTPUT OPENMC_IPO_ERROR LANGUAGES CXX)
+  if(NOT OPENMC_HAVE_IPO)
+    message(FATAL_ERROR "IPO/LTO is not supported: ${OPENMC_IPO_ERROR}")
+  endif()
+endif()
+
+string(TOUPPER "${OPENMC_PGO_MODE}" OPENMC_PGO_MODE)
+if(NOT OPENMC_PGO_MODE MATCHES "^(OFF|GENERATE|USE)$")
+  message(FATAL_ERROR "OPENMC_PGO_MODE must be OFF, GENERATE, or USE")
+endif()
+
+if(NOT OPENMC_PGO_MODE STREQUAL "OFF")
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "Directory-based PGO is currently supported only with GNU C++")
+  endif()
+  if(OPENMC_PGO_MODE STREQUAL "GENERATE")
+    file(MAKE_DIRECTORY "${OPENMC_PGO_PROFILE_DIR}")
+    set(OPENMC_PGO_FLAG "-fprofile-generate=${OPENMC_PGO_PROFILE_DIR}")
+  else()
+    if(NOT IS_DIRECTORY "${OPENMC_PGO_PROFILE_DIR}")
+      message(FATAL_ERROR
+        "OPENMC_PGO_PROFILE_DIR does not exist: ${OPENMC_PGO_PROFILE_DIR}")
+    endif()
+    set(OPENMC_PGO_FLAG "-fprofile-use=${OPENMC_PGO_PROFILE_DIR}")
+    list(APPEND cxxflags -fprofile-correction)
+  endif()
+  list(APPEND cxxflags "${OPENMC_PGO_FLAG}")
+  list(APPEND ldflags "${OPENMC_PGO_FLAG}")
+endif()
 
 # When OPENMC_ENABLE_STRICT_FP is enabled, disable compiler optimizations that change
 # floating-point results relative to -O0, improving cross-platform and
@@ -617,6 +669,9 @@ target_link_libraries(openmc libopenmc)
 target_compile_features(openmc PUBLIC cxx_std_17)
 target_compile_features(libopenmc PUBLIC cxx_std_17)
 set_target_properties(openmc libopenmc PROPERTIES CXX_EXTENSIONS OFF)
+if(OPENMC_ENABLE_IPO)
+  set_target_properties(openmc libopenmc PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
 
 #===============================================================================
 # Python package

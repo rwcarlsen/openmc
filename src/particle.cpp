@@ -557,7 +557,7 @@ void Particle::event_check_limit_and_revive()
   }
 }
 
-void Particle::event_death()
+void Particle::event_death(HistoryContributions& contributions)
 {
 #ifdef OPENMC_DAGMC_ENABLED
   history().reset();
@@ -569,30 +569,14 @@ void Particle::event_death()
     finalize_particle_track(*this);
   }
 
-  // Contribute tally reduction variables to global accumulator
-  const auto k_absorption = keff_tally_absorption();
-  const auto k_collision = keff_tally_collision();
-  const auto k_tracklength = keff_tally_tracklength();
-  const auto leakage = keff_tally_leakage();
-
+  // Contribute to the worker-local accumulator. The transport driver merges
+  // these values after all parallel work is complete.
   if (settings::run_mode == RunMode::EIGENVALUE) {
-    if (k_absorption != 0.0) {
-#pragma omp atomic
-      global_tally_absorption += k_absorption;
-    }
-    if (k_collision != 0.0) {
-#pragma omp atomic
-      global_tally_collision += k_collision;
-    }
-    if (k_tracklength != 0.0) {
-#pragma omp atomic
-      global_tally_tracklength += k_tracklength;
-    }
+    contributions.k_absorption += keff_tally_absorption();
+    contributions.k_collision += keff_tally_collision();
+    contributions.k_tracklength += keff_tally_tracklength();
   }
-  if (leakage != 0.0) {
-#pragma omp atomic
-    global_tally_leakage += leakage;
-  }
+  contributions.leakage += keff_tally_leakage();
 
   // Reset particle tallies once accumulated
   keff_tally_absorption() = 0.0;
@@ -606,8 +590,7 @@ void Particle::event_death()
 
   // Accumulate track count for this particle history
   if (!settings::use_shared_secondary_bank) {
-#pragma omp atomic
-    simulation::simulation_tracks_completed += n_tracks();
+    contributions.tracks += n_tracks();
   }
 
   // Record the number of progeny created by this particle.

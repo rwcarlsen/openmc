@@ -433,6 +433,22 @@ OPENMC_ENABLE_COVERAGE
 OPENMC_ENABLE_PROFILE
   Enables profiling using the GNU profiler, gprof. (Default: off)
 
+OPENMC_ENABLE_NATIVE
+  Enables ``-march=native`` when supported, allowing the compiler to generate
+  instructions for the CPU that performs the build. Binaries may not run on
+  other CPU models. (Default: off)
+
+OPENMC_ENABLE_IPO
+  Enables CMake's interprocedural optimization (IPO/LTO) support after checking
+  that it is available from the selected compiler. (Default: off)
+
+OPENMC_PGO_MODE
+  Enables GNU profile-guided optimization. Set to ``GENERATE`` to instrument a
+  build, run representative workloads, then reconfigure the same build directory
+  with ``USE``. Profile data is read from and written to
+  ``OPENMC_PGO_PROFILE_DIR``, which defaults to ``<build>/pgo-data``. (Default:
+  ``OFF``)
+
 OPENMC_USE_OPENMP
   Enables shared-memory parallelism using the OpenMP API. The C++ compiler
   being used must support OpenMP. (Default: on)
