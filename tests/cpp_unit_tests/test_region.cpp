@@ -816,3 +816,32 @@ TEST_CASE("Missed bounds fall back to canonical surface traversal")
   }
 
 }
+
+TEST_CASE("Compiled Boolean constants preserve canonical expressions")
+{
+  BoundedBranchFixture fixture;
+
+  SECTION("Complementary union is always true")
+  {
+    openmc::Region region("1 | -1", 0);
+    REQUIRE(region.contains({100.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0));
+    const auto [distance, surface] =
+      region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0, true);
+    REQUIRE(distance == openmc::INFTY);
+    REQUIRE(surface == std::numeric_limits<int32_t>::max());
+    REQUIRE(std::accumulate(fixture.distance_calls.begin(),
+              fixture.distance_calls.end(), 0) == 0);
+  }
+
+  SECTION("Union of contradictory branches is always false")
+  {
+    openmc::Region region("(1 -1) | (2 -2)", 0);
+    REQUIRE_FALSE(region.contains({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0));
+    const auto [distance, surface] =
+      region.distance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0);
+    REQUIRE(distance == openmc::INFTY);
+    REQUIRE(surface == std::numeric_limits<int32_t>::max());
+    REQUIRE(std::accumulate(fixture.distance_calls.begin(),
+              fixture.distance_calls.end(), 0) == 0);
+  }
+}

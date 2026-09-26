@@ -33,6 +33,8 @@ constexpr int32_t OP_RIGHT_PAREN {std::numeric_limits<int32_t>::max() - 1};
 constexpr int32_t OP_COMPLEMENT {std::numeric_limits<int32_t>::max() - 2};
 constexpr int32_t OP_INTERSECTION {std::numeric_limits<int32_t>::max() - 3};
 constexpr int32_t OP_UNION {std::numeric_limits<int32_t>::max() - 4};
+constexpr int32_t OP_FALSE {std::numeric_limits<int32_t>::max() - 5};
+constexpr int32_t OP_TRUE {std::numeric_limits<int32_t>::max() - 6};
 
 //==============================================================================
 // Global variables
@@ -124,30 +126,30 @@ private:
   std::pair<double, int32_t> distance_to_nearest_surface(Position r,
     Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
     double max_distance,
-    const vector<std::size_t>* candidate_surfaces = nullptr) const;
+    const vector<uint32_t>* candidate_surfaces = nullptr) const;
 
   //! Find the oncoming boundary of this cell for a complex cell.
   std::pair<double, int32_t> distance_complex(
     Position r, Direction u, int32_t on_surface, bool known_inside,
-    double max_distance, const vector<std::size_t>& candidate_surfaces) const;
+    double max_distance, const vector<uint32_t>& candidate_surfaces) const;
 
   //! Exact rescan traversal used for ambiguous event groups.
   std::pair<double, int32_t> distance_complex_fallback(
     Position r, Direction u, int32_t on_surface, bool known_inside,
     double max_distance,
-    const vector<std::size_t>* candidate_surfaces = nullptr) const;
+    const vector<uint32_t>* candidate_surfaces = nullptr) const;
 
   //! Find a complex-region boundary when every surface has one ray crossing.
   std::pair<double, int32_t> distance_complex_planes(Position r, Direction u,
     int32_t on_surface, bool known_inside, double max_distance,
-    const vector<std::size_t>& candidate_surfaces) const;
+    const vector<uint32_t>& candidate_surfaces) const;
 
   //! Evaluate one node in the compiled Boolean expression.
   bool evaluate_boolean_node(int node, Position r, Direction u,
     vector<int8_t>& values) const;
 
   //! Collect unique surfaces in bounded Boolean branches crossed by a ray.
-  const vector<std::size_t>& candidate_surfaces(
+  const vector<uint32_t>& candidate_surfaces(
     Position r, Direction u, double max_distance) const;
 
   struct RayBound {
@@ -220,20 +222,30 @@ private:
   vector<std::size_t> short_circuit_jump_;
   struct BooleanNode {
     int32_t token;
-    int left {-1};
-    int right {-1};
-    int parent {-1};
-    std::size_t surface {0};
-    RayBound bound;
+    int32_t left {-1};
+    int32_t right {-1};
+    int32_t parent {-1};
+    uint32_t surface {0};
+  };
+  enum class CandidateKind : uint8_t { BRANCH, LEAF };
+  struct CandidateRecord {
+    uint32_t escape {0};
+    uint32_t surface {0};
+    CandidateKind kind {CandidateKind::BRANCH};
   };
   //! Compiled expression tree and leaf nodes grouped by unique surface.
   vector<BooleanNode> boolean_nodes_;
+  vector<RayBound> boolean_bounds_;
   vector<vector<int>> surface_leaf_nodes_;
   vector<vector<int>> surface_ancestor_nodes_;
-  //! Pre-order node sequence, subtree escape indices, and bound-test flags.
-  vector<int> candidate_traversal_;
-  vector<int> candidate_escape_;
-  vector<uint8_t> candidate_test_bound_;
+  vector<uint32_t> surface_leaf_offsets_;
+  vector<uint32_t> surface_leaf_indices_;
+  vector<uint32_t> surface_ancestor_offsets_;
+  vector<uint32_t> surface_ancestor_indices_;
+  //! Compact pre-order traversal records and aligned effective bounds.
+  vector<CandidateRecord> candidate_records_;
+  vector<RayBound> candidate_bounds_;
+  RayBound candidate_root_bound_;
   int boolean_root_ {-1};
   enum class PlaneType : uint8_t { NONE, X, Y, Z, GENERAL };
   struct PlaneKernel {
@@ -244,6 +256,7 @@ private:
   vector<PlaneKernel> plane_kernels_;
   bool simple_; //!< Does the region contain only intersections?
   bool all_surfaces_are_planes_ {true};
+  int8_t compiled_constant_ {-1};
 };
 
 //==============================================================================

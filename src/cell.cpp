@@ -793,7 +793,7 @@ Region::Region(std::string region_spec, int32_t cell_id)
           kernel.type = PlaneType::Z;
           kernel.coefficients[0] = plane->z0_;
         } else if (const auto* plane =
-                    dynamic_cast<const SurfacePlane*>(surface)) {
+                     dynamic_cast<const SurfacePlane*>(surface)) {
           kernel.type = PlaneType::GENERAL;
           kernel.coefficients[0] = plane->A_;
           kernel.coefficients[1] = plane->B_;
@@ -826,7 +826,9 @@ Region::Region(std::string region_spec, int32_t cell_id)
           const auto& surf = *model::surfaces[std::abs(token) - 1];
           const auto bound =
             compile_bound(conservative_halfspace_bound(surf, token > 0));
-          boolean_nodes_.push_back({token, -1, -1, -1, surface, bound});
+          boolean_nodes_.push_back(
+            {token, -1, -1, -1, static_cast<uint32_t>(surface)});
+          boolean_bounds_.push_back(bound);
           surface_leaf_nodes_[surface].push_back(node);
           node_stack.push_back(node);
         } else {
@@ -836,12 +838,12 @@ Region::Region(std::string region_spec, int32_t cell_id)
           node_stack.pop_back();
           const int node = boolean_nodes_.size();
           const BoundingBox bbox = token == OP_INTERSECTION
-                                      ? boolean_nodes_[left].bound.box &
-                                          boolean_nodes_[right].bound.box
-                                      : boolean_nodes_[left].bound.box |
-                                          boolean_nodes_[right].bound.box;
-          boolean_nodes_.push_back(
-            {token, left, right, -1, 0, compile_bound(bbox)});
+                                      ? boolean_bounds_[left].box &
+                                          boolean_bounds_[right].box
+                                      : boolean_bounds_[left].box |
+                                          boolean_bounds_[right].box;
+          boolean_nodes_.push_back({token, left, right, -1, 0});
+          boolean_bounds_.push_back(compile_bound(bbox));
           boolean_nodes_[left].parent = node;
           boolean_nodes_[right].parent = node;
           node_stack.push_back(node);
@@ -849,6 +851,10 @@ Region::Region(std::string region_spec, int32_t cell_id)
       }
       boolean_root_ = node_stack.back();
       balance_boolean_tree();
+      if (boolean_nodes_[boolean_root_].token == OP_FALSE)
+        compiled_constant_ = 0;
+      else if (boolean_nodes_[boolean_root_].token == OP_TRUE)
+        compiled_constant_ = 1;
       compile_boolean_metadata();
     }
 
@@ -880,8 +886,11 @@ Region::Region(std::string region_spec, int32_t cell_id)
 void Region::balance_boolean_tree()
 {
   vector<BooleanNode> old_nodes = std::move(boolean_nodes_);
+  vector<RayBound> old_bounds = std::move(boolean_bounds_);
   boolean_nodes_.clear();
+  boolean_bounds_.clear();
   boolean_nodes_.reserve(old_nodes.size());
+  boolean_bounds_.reserve(old_bounds.size());
   for (auto& leaves : surface_leaf_nodes_)
     leaves.clear();
 
@@ -896,75 +905,202 @@ void Region::balance_boolean_tree()
     }
   };
 
-  std::function<int(int)> rebuild;
-  std::function<int(const vector<int>&, std::size_t, std::size_t, int32_t)>
-    join;
-  join = [&](const vector<int>& operands, std::size_t begin, std::size_t end,
+  auto add_constant = [&](bool value) {
+    const int node = boolean_nodes_.size();
+    boolean_nodes_.push_back(
+      {value ? OP_TRUE : OP_FALSE, -1, -1, -1, 0});
+    boolean_bounds_.push_back(compile_bound(
+      value ? BoundingBox::infinite() : BoundingBox::inverted()));
+    return node;
+  };
+
+  std::function<bool(int, int)> equivalent;
+  equivalent = [&](int a, int b) {
+    const auto& lhs = boolean_nodes_[a];
+    const auto& rhs = boolean_nodes_[b];
+    if (lhs.token != rhs.token)
+      return false;
+    if (lhs.token < OP_UNION || lhs.token == OP_TRUE || lhs.token == OP_FALSE)
+      return true;
+    return equivalent(lhs.left, rhs.left) && equivalent(lhs.right, rhs.right);
+  };
+
+  std::function<int(const vector<int>&, std::size_t, std::size_t, int32_t)> join;
+  join = [&](const vector<int>& children, std::size_t begin, std::size_t end,
            int32_t token) {
     if (end - begin == 1)
-      return rebuild(operands[begin]);
+      return children[begin];
     const std::size_t middle = begin + (end - begin) / 2;
-    const int left = join(operands, begin, middle, token);
-    const int right = join(operands, middle, end, token);
+    const int left = join(children, begin, middle, token);
+    const int right = join(children, middle, end, token);
     const int node = boolean_nodes_.size();
     const BoundingBox bbox = token == OP_INTERSECTION
-                               ? boolean_nodes_[left].bound.box &
-                                   boolean_nodes_[right].bound.box
-                               : boolean_nodes_[left].bound.box |
-                                   boolean_nodes_[right].bound.box;
-    boolean_nodes_.push_back(
-      {token, left, right, -1, 0, compile_bound(bbox)});
+                               ? boolean_bounds_[left].box &
+                                   boolean_bounds_[right].box
+                               : boolean_bounds_[left].box |
+                                   boolean_bounds_[right].box;
+    boolean_nodes_.push_back({token, left, right, -1, 0});
+    boolean_bounds_.push_back(compile_bound(bbox));
     boolean_nodes_[left].parent = node;
     boolean_nodes_[right].parent = node;
     return node;
   };
+  std::function<int(int)> rebuild;
   rebuild = [&](int old_node) {
     const auto& item = old_nodes[old_node];
     if (item.token < OP_UNION) {
       const int node = boolean_nodes_.size();
       boolean_nodes_.push_back(
-        {item.token, -1, -1, -1, item.surface, item.bound});
-      surface_leaf_nodes_[item.surface].push_back(node);
+        {item.token, -1, -1, -1, item.surface});
+      boolean_bounds_.push_back(old_bounds[old_node]);
       return node;
     }
 
     vector<int> operands;
     collect_operands(old_node, item.token, operands);
-    return join(operands, 0, operands.size(), item.token);
+    vector<int> children;
+    children.reserve(operands.size());
+    for (int operand : operands) {
+      const int child = rebuild(operand);
+      const int32_t child_token = boolean_nodes_[child].token;
+      const bool annihilator = item.token == OP_INTERSECTION
+                                 ? child_token == OP_FALSE
+                                 : child_token == OP_TRUE;
+      if (annihilator)
+        return child;
+      const bool identity = item.token == OP_INTERSECTION
+                              ? child_token == OP_TRUE
+                              : child_token == OP_FALSE;
+      if (identity)
+        continue;
+
+      bool duplicate {false};
+      for (int previous : children) {
+        if (equivalent(previous, child)) {
+          duplicate = true;
+          break;
+        }
+        const auto& previous_node = boolean_nodes_[previous];
+        const auto& child_node = boolean_nodes_[child];
+        if (previous_node.token < OP_UNION && child_node.token < OP_UNION &&
+            previous_node.token == -child_node.token) {
+          return add_constant(item.token == OP_UNION);
+        }
+      }
+      if (!duplicate)
+        children.push_back(child);
+    }
+    if (children.empty())
+      return add_constant(item.token == OP_INTERSECTION);
+    if (children.size() == 1)
+      return children.front();
+    return join(children, 0, children.size(), item.token);
   };
   boolean_root_ = rebuild(boolean_root_);
+
+  // Repack only nodes reachable from the simplified root so discarded
+  // duplicate and constant-folded branches do not occupy transport caches.
+  old_nodes = std::move(boolean_nodes_);
+  old_bounds = std::move(boolean_bounds_);
+  boolean_nodes_.clear();
+  boolean_bounds_.clear();
+  boolean_nodes_.reserve(old_nodes.size());
+  boolean_bounds_.reserve(old_bounds.size());
+  std::function<int(int)> compact;
+  compact = [&](int old_node) {
+    const auto item = old_nodes[old_node];
+    int left {-1};
+    int right {-1};
+    if (item.token == OP_INTERSECTION || item.token == OP_UNION) {
+      left = compact(item.left);
+      right = compact(item.right);
+    }
+    const int node = boolean_nodes_.size();
+    boolean_nodes_.push_back(
+      {item.token, left, right, -1, item.surface});
+    boolean_bounds_.push_back(old_bounds[old_node]);
+    if (left >= 0)
+      boolean_nodes_[left].parent = node;
+    if (right >= 0)
+      boolean_nodes_[right].parent = node;
+    return node;
+  };
+  boolean_root_ = compact(boolean_root_);
+
+  std::function<void(int)> collect_leaves;
+  collect_leaves = [&](int node) {
+    const auto& item = boolean_nodes_[node];
+    if (item.token == OP_TRUE || item.token == OP_FALSE) {
+      return;
+    } else if (item.token < OP_UNION) {
+      surface_leaf_nodes_[item.surface].push_back(node);
+    } else if (item.token == OP_INTERSECTION || item.token == OP_UNION) {
+      collect_leaves(item.left);
+      collect_leaves(item.right);
+    }
+  };
+  collect_leaves(boolean_root_);
 }
 
 //==============================================================================
 
 void Region::compile_boolean_metadata()
 {
-  candidate_traversal_.clear();
-  candidate_escape_.clear();
-  candidate_test_bound_.clear();
-  candidate_traversal_.reserve(boolean_nodes_.size());
-  candidate_escape_.reserve(boolean_nodes_.size());
-  candidate_test_bound_.reserve(boolean_nodes_.size());
+  candidate_records_.clear();
+  candidate_bounds_.clear();
+  candidate_records_.reserve(boolean_nodes_.size());
+  candidate_bounds_.reserve(boolean_nodes_.size());
+  candidate_root_bound_ = boolean_bounds_[boolean_root_];
 
   std::function<void(int, bool)> append;
   append = [&](int node, bool test_bound) {
-    const std::size_t position = candidate_traversal_.size();
-    candidate_traversal_.push_back(node);
-    candidate_escape_.push_back(0);
-    candidate_test_bound_.push_back(test_bound);
     const auto& item = boolean_nodes_[node];
-    if (item.token >= OP_UNION) {
-      const bool test_children = item.token == OP_UNION;
-      append(item.left, test_children);
-      append(item.right, test_children);
+    if (item.token == OP_TRUE || item.token == OP_FALSE)
+      return;
+    if (item.token < OP_UNION) {
+      BoundingBox bbox = surface_bounds_[item.surface].box;
+      if (test_bound)
+        bbox &= boolean_bounds_[node].box;
+      candidate_records_.push_back({static_cast<uint32_t>(
+                                       candidate_records_.size() + 1),
+        item.surface, CandidateKind::LEAF});
+      candidate_bounds_.push_back(compile_bound(bbox));
+      return;
     }
-    candidate_escape_[position] = candidate_traversal_.size();
+
+    std::size_t position = candidate_records_.size();
+    if (test_bound) {
+      candidate_records_.push_back(
+        {0, 0, CandidateKind::BRANCH});
+      candidate_bounds_.push_back(boolean_bounds_[node]);
+    }
+    const bool test_children = item.token == OP_UNION;
+    append(item.left, test_children);
+    append(item.right, test_children);
+    if (test_bound)
+      candidate_records_[position].escape = candidate_records_.size();
   };
   append(boolean_root_, false);
+
+  boolean_bounds_.clear();
+  boolean_bounds_.shrink_to_fit();
+  surface_bounds_.clear();
+  surface_bounds_.shrink_to_fit();
 
   surface_ancestor_nodes_.clear();
   surface_ancestor_nodes_.resize(surface_leaf_nodes_.size());
   vector<uint32_t> marks(boolean_nodes_.size(), 0);
+  vector<uint32_t> depths(boolean_nodes_.size(), 0);
+  std::function<void(int, uint32_t)> assign_depth;
+  assign_depth = [&](int node, uint32_t depth) {
+    depths[node] = depth;
+    const auto& item = boolean_nodes_[node];
+    if (item.token == OP_INTERSECTION || item.token == OP_UNION) {
+      assign_depth(item.left, depth + 1);
+      assign_depth(item.right, depth + 1);
+    }
+  };
+  assign_depth(boolean_root_, 0);
   uint32_t epoch {0};
   for (std::size_t surface = 0; surface < surface_leaf_nodes_.size(); ++surface) {
     ++epoch;
@@ -977,7 +1113,28 @@ void Region::compile_boolean_metadata()
         }
       }
     }
+    auto& ancestors = surface_ancestor_nodes_[surface];
+    std::sort(ancestors.begin(), ancestors.end(),
+      [&](int a, int b) { return depths[a] > depths[b]; });
   }
+
+  surface_leaf_offsets_.reserve(surface_leaf_nodes_.size() + 1);
+  surface_ancestor_offsets_.reserve(surface_ancestor_nodes_.size() + 1);
+  for (std::size_t surface = 0; surface < surface_leaf_nodes_.size(); ++surface) {
+    surface_leaf_offsets_.push_back(surface_leaf_indices_.size());
+    surface_leaf_indices_.insert(surface_leaf_indices_.end(),
+      surface_leaf_nodes_[surface].begin(), surface_leaf_nodes_[surface].end());
+    surface_ancestor_offsets_.push_back(surface_ancestor_indices_.size());
+    surface_ancestor_indices_.insert(surface_ancestor_indices_.end(),
+      surface_ancestor_nodes_[surface].begin(),
+      surface_ancestor_nodes_[surface].end());
+  }
+  surface_leaf_offsets_.push_back(surface_leaf_indices_.size());
+  surface_ancestor_offsets_.push_back(surface_ancestor_indices_.size());
+  surface_leaf_nodes_.clear();
+  surface_leaf_nodes_.shrink_to_fit();
+  surface_ancestor_nodes_.clear();
+  surface_ancestor_nodes_.shrink_to_fit();
 }
 
 //==============================================================================
@@ -1220,6 +1377,8 @@ std::pair<double, int32_t> Region::distance(
   Position r, Direction u, int32_t on_surface, bool known_inside,
   double max_distance) const
 {
+  if (compiled_constant_ >= 0)
+    return {INFTY, std::numeric_limits<int32_t>::max()};
   if (simple_) {
     return distance_to_nearest_surface(
       r, u, on_surface, false, max_distance);
@@ -1245,7 +1404,7 @@ std::pair<double, int32_t> Region::distance(
 
 std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
   Direction u, int32_t on_surface, bool ignore_coincident_surfaces,
-  double max_distance, const vector<std::size_t>* candidate_surfaces) const
+  double max_distance, const vector<uint32_t>* candidate_surfaces) const
 {
   double min_dist {INFTY};
   int32_t i_surf {std::numeric_limits<int32_t>::max()};
@@ -1286,11 +1445,11 @@ std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
 
 std::pair<double, int32_t> Region::distance_complex(
   Position r, Direction u, int32_t on_surface, bool known_inside,
-  double max_distance, const vector<std::size_t>& candidate_surfaces) const
+  double max_distance, const vector<uint32_t>& candidate_surfaces) const
 {
   struct SurfaceEvent {
     double distance;
-    std::size_t surface;
+    uint32_t surface;
   };
   struct EventCompare {
     bool operator()(const SurfaceEvent& a, const SurfaceEvent& b) const
@@ -1303,7 +1462,7 @@ std::pair<double, int32_t> Region::distance_complex(
   static thread_local vector<SurfaceEvent> events;
   events.clear();
   events.reserve(candidate_surfaces.size());
-  for (std::size_t i : candidate_surfaces) {
+  for (uint32_t i : candidate_surfaces) {
     const int32_t token = surface_tokens_[i];
     const bool coincident {std::abs(token) == std::abs(on_surface)};
     const double distance =
@@ -1329,8 +1488,8 @@ std::pair<double, int32_t> Region::distance_complex(
     }
   }
   const bool in_region = known_inside ||
-                         evaluate_boolean_node(
-                           boolean_root_, r, u, boolean_values);
+                          evaluate_boolean_node(
+                            boolean_root_, r, u, boolean_values);
 
   while (!events.empty()) {
     std::pop_heap(events.begin(), events.end(), compare);
@@ -1392,10 +1551,10 @@ std::pair<double, int32_t> Region::distance_complex(
 
 std::pair<double, int32_t> Region::distance_complex_fallback(
   Position r, Direction u, int32_t on_surface, bool known_inside,
-  double max_distance, const vector<std::size_t>* candidate_surfaces) const
+  double max_distance, const vector<uint32_t>* candidate_surfaces) const
 {
   const bool in_region = known_inside || contains_complex(r, u, on_surface);
-  auto search = [&](const vector<std::size_t>* candidates) {
+  auto search = [&](const vector<uint32_t>* candidates) {
     Position current_r {r};
     int32_t current_surface {on_surface};
     double total_distance {0.0};
@@ -1438,7 +1597,11 @@ bool Region::evaluate_boolean_node(
 
   const auto& item = boolean_nodes_[node];
   bool value;
-  if (item.token < OP_UNION) {
+  if (item.token == OP_TRUE) {
+    value = true;
+  } else if (item.token == OP_FALSE) {
+    value = false;
+  } else if (item.token < OP_UNION) {
     const bool sense = plane_kernels_[item.surface].type != PlaneType::NONE
                          ? plane_sense(item.surface, r, u)
                          : model::surfaces[std::abs(item.token) - 1]->sense(r, u);
@@ -1457,11 +1620,11 @@ bool Region::evaluate_boolean_node(
 
 //==============================================================================
 
-const vector<std::size_t>& Region::candidate_surfaces(
+const vector<uint32_t>& Region::candidate_surfaces(
   Position r, Direction u, double max_distance) const
 {
   struct Scratch {
-    vector<std::size_t> candidates;
+    vector<uint32_t> candidates;
     vector<uint32_t> marks;
     uint32_t epoch {0};
   };
@@ -1490,32 +1653,28 @@ const vector<std::size_t>& Region::candidate_surfaces(
 
   double entry {0.0};
   double exit {max_distance};
-  if (!intersect_bound(
-        boolean_nodes_[boolean_root_].bound, ray, entry, exit))
+  if (!intersect_bound(candidate_root_bound_, ray, entry, exit))
     return scratch.candidates;
 
   std::size_t cursor {0};
-  while (cursor < candidate_traversal_.size()) {
-    const int node_index = candidate_traversal_[cursor];
-    const auto& node = boolean_nodes_[node_index];
-    if (candidate_test_bound_[cursor]) {
-      double node_entry {entry};
-      double node_exit {exit};
-      if (!intersect_bound(node.bound, ray, node_entry, node_exit)) {
-        cursor = candidate_escape_[cursor];
-        continue;
-      }
+  while (cursor < candidate_records_.size()) {
+    const auto& record = candidate_records_[cursor];
+    if (record.kind == CandidateKind::LEAF &&
+        scratch.marks[record.surface] == scratch.epoch) {
+      ++cursor;
+      continue;
     }
 
-    if (node.token < OP_UNION) {
-      double surface_entry {entry};
-      double surface_exit {exit};
-      if (intersect_bound(
-            surface_bounds_[node.surface], ray, surface_entry, surface_exit) &&
-          scratch.marks[node.surface] != scratch.epoch) {
-        scratch.marks[node.surface] = scratch.epoch;
-        scratch.candidates.push_back(node.surface);
-      }
+    double node_entry {entry};
+    double node_exit {exit};
+    if (!intersect_bound(
+          candidate_bounds_[cursor], ray, node_entry, node_exit)) {
+      cursor = record.escape;
+      continue;
+    }
+    if (record.kind == CandidateKind::LEAF) {
+      scratch.marks[record.surface] = scratch.epoch;
+      scratch.candidates.push_back(record.surface);
     }
     ++cursor;
   }
@@ -1551,16 +1710,14 @@ bool Region::intersect_bound(const RayBound& bound, const RaySlabData& ray,
   if (bound.empty)
     return false;
 
-  for (int axis = 0; axis < 3; ++axis) {
+  auto intersect_axis = [&](int axis) {
     const uint8_t bit = 1 << axis;
-    if (!(bound.active_axes & bit))
-      continue;
     const double lower = bound.box.min[axis];
     const double upper = bound.box.max[axis];
     if (ray.parallel_axes & bit) {
       if (ray.origin[axis] < lower || ray.origin[axis] > upper)
         return false;
-      continue;
+      return true;
     }
     double axis_entry =
       (lower - ray.origin[axis]) * ray.inverse[axis];
@@ -1571,8 +1728,27 @@ bool Region::intersect_bound(const RayBound& bound, const RaySlabData& ray,
     exit = std::min(exit, axis_exit);
     if (entry > exit)
       return false;
+    return true;
+  };
+
+  switch (bound.active_axes) {
+  case 0:
+    return true;
+  case 1:
+    return intersect_axis(0);
+  case 2:
+    return intersect_axis(1);
+  case 3:
+    return intersect_axis(0) && intersect_axis(1);
+  case 4:
+    return intersect_axis(2);
+  case 5:
+    return intersect_axis(0) && intersect_axis(2);
+  case 6:
+    return intersect_axis(1) && intersect_axis(2);
+  default:
+    return intersect_axis(0) && intersect_axis(1) && intersect_axis(2);
   }
-  return entry <= exit && exit >= 0.0;
 }
 
 //==============================================================================
@@ -1581,12 +1757,29 @@ void Region::set_surface_boolean_value(
   std::size_t surface, bool positive_side, vector<int8_t>& values,
   bool invalidate) const
 {
-  for (int leaf : surface_leaf_nodes_[surface]) {
+  for (uint32_t i = surface_leaf_offsets_[surface];
+       i < surface_leaf_offsets_[surface + 1]; ++i) {
+    const int leaf = surface_leaf_indices_[i];
     values[leaf] = positive_side == (boolean_nodes_[leaf].token > 0);
   }
-  if (invalidate)
-    for (int node : surface_ancestor_nodes_[surface])
-      values[node] = -1;
+  if (invalidate) {
+    for (uint32_t i = surface_ancestor_offsets_[surface];
+         i < surface_ancestor_offsets_[surface + 1]; ++i) {
+      const int node = surface_ancestor_indices_[i];
+      const auto& item = boolean_nodes_[node];
+      const int8_t left = values[item.left];
+      const int8_t right = values[item.right];
+      if (item.token == OP_INTERSECTION) {
+        values[node] = left == 0 || right == 0
+                         ? 0
+                         : left == 1 && right == 1 ? 1 : -1;
+      } else {
+        values[node] = left == 1 || right == 1
+                         ? 1
+                         : left == 0 && right == 0 ? 0 : -1;
+      }
+    }
+  }
 }
 
 //==============================================================================
@@ -1676,8 +1869,9 @@ bool Region::plane_sense(
     return false;
   }
 
-  if (std::abs(value) < FP_COINCIDENT)
+  if (std::abs(value) < FP_COINCIDENT) {
     return plane_normal_projection(surface, u) > 0.0;
+  }
   return value > 0.0;
 }
 
@@ -1685,19 +1879,19 @@ bool Region::plane_sense(
 
 std::pair<double, int32_t> Region::distance_complex_planes(Position r,
   Direction u, int32_t on_surface, bool known_inside, double max_distance,
-  const vector<std::size_t>& candidate_surfaces) const
+  const vector<uint32_t>& candidate_surfaces) const
 {
   struct Crossing {
     double distance;
     int32_t token;
-    std::size_t surface;
+    uint32_t surface;
     bool used;
   };
 
   static thread_local vector<Crossing> crossings;
   crossings.clear();
   crossings.reserve(candidate_surfaces.size());
-  for (std::size_t i : candidate_surfaces) {
+  for (uint32_t i : candidate_surfaces) {
     const int32_t token = surface_tokens_[i];
     const bool coincident {std::abs(token) == std::abs(on_surface)};
     const double distance = plane_distance(i, r, u, coincident);
@@ -1718,8 +1912,8 @@ std::pair<double, int32_t> Region::distance_complex_planes(Position r,
     }
   }
   const bool in_region = known_inside ||
-                         evaluate_boolean_node(
-                           boolean_root_, r, u, boolean_values);
+                          evaluate_boolean_node(
+                            boolean_root_, r, u, boolean_values);
   double total_distance {0.0};
   bool ignore_coincident {on_surface != 0};
   while (true) {
@@ -1792,7 +1986,6 @@ bool Region::contains_simple(Position r, Direction u, int32_t on_surface) const
     } else if (-token == on_surface) {
       return false;
     } else {
-      // Note the off-by-one indexing
       bool sense = model::surfaces[abs(token) - 1]->sense(r, u);
       if (sense != (token > 0)) {
         return false;
@@ -1822,7 +2015,6 @@ bool Region::contains_complex(Position r, Direction u, int32_t on_surface) const
       } else if (-token == on_surface) {
         in_cell = false;
       } else {
-        // Note the off-by-one indexing
         bool sense = model::surfaces[abs(token) - 1]->sense(r, u);
         in_cell = (sense == (token > 0));
       }
