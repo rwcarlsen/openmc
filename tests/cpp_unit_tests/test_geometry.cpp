@@ -221,6 +221,49 @@ private:
   openmc::vector<int>* calls_;
 };
 
+class LimitedDistanceCell : public openmc::Cell {
+public:
+  LimitedDistanceCell(int id, double boundary, openmc::vector<int>& calls,
+    openmc::vector<double>& limits)
+    : boundary_ {boundary}, calls_ {calls}, limits_ {limits}
+  {
+    id_ = id;
+    fill_ = openmc::C_NONE;
+    type_ = openmc::Fill::MATERIAL;
+  }
+
+  bool contains(openmc::Position, openmc::Direction, int32_t) const override
+  {
+    return true;
+  }
+
+  std::pair<double, int32_t> distance(openmc::Position, openmc::Direction,
+    int32_t, openmc::GeometryState*, bool, double max_distance) const override
+  {
+    calls_.push_back(id_);
+    limits_.push_back(max_distance);
+    return boundary_ < max_distance
+             ? std::pair<double, int32_t> {boundary_, id_}
+             : std::pair<double, int32_t> {
+                 openmc::INFTY, openmc::SURFACE_NONE};
+  }
+
+  void to_hdf5_inner(hid_t) const override {}
+  openmc::BoundingBox bounding_box() const override
+  {
+    return openmc::BoundingBox::infinite();
+  }
+  openmc::GeometryType geom_type() const override
+  {
+    return openmc::GeometryType::CSG;
+  }
+
+private:
+  double boundary_;
+  openmc::vector<int>& calls_;
+  openmc::vector<double>& limits_;
+};
+
 class AcceleratorFixture {
 public:
   AcceleratorFixture()
@@ -314,6 +357,61 @@ TEST_CASE("Distance to boundary uses the predecoded plane projection")
   REQUIRE(boundary.distance() == 1.0);
   REQUIRE(boundary.surface() == 1);
   REQUIRE(fixture.normal_calls == 0);
+}
+
+TEST_CASE("Inner boundaries clip enclosing region searches")
+{
+  const int old_levels = openmc::model::n_coord_levels;
+  openmc::model::n_coord_levels = 2;
+  openmc::vector<int> calls;
+  openmc::vector<double> limits;
+  openmc::model::cells.clear();
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(10, 10.0, calls, limits));
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(20, 1.0, calls, limits));
+
+  openmc::GeometryState p;
+  p.n_coord() = 2;
+  p.coord(0).cell() = 0;
+  p.coord(1).cell() = 1;
+  const auto boundary = openmc::distance_to_boundary(p);
+
+  REQUIRE(boundary.distance() == 1.0);
+  REQUIRE(boundary.coord_level() == 2);
+  REQUIRE(calls == openmc::vector<int> {20, 10});
+  REQUIRE(limits[0] == openmc::INFTY);
+  REQUIRE(limits[1] > 1.0);
+  REQUIRE(limits[1] < 1.001);
+
+  openmc::model::cells.clear();
+  openmc::model::n_coord_levels = old_levels;
+}
+
+TEST_CASE("Coincident enclosing boundaries retain precedence")
+{
+  const int old_levels = openmc::model::n_coord_levels;
+  openmc::model::n_coord_levels = 2;
+  openmc::vector<int> calls;
+  openmc::vector<double> limits;
+  openmc::model::cells.clear();
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(10, 1.0, calls, limits));
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(20, 1.0, calls, limits));
+
+  openmc::GeometryState p;
+  p.n_coord() = 2;
+  p.coord(0).cell() = 0;
+  p.coord(1).cell() = 1;
+  const auto boundary = openmc::distance_to_boundary(p);
+
+  REQUIRE(boundary.distance() == 1.0);
+  REQUIRE(boundary.surface() == 10);
+  REQUIRE(boundary.coord_level() == 1);
+
+  openmc::model::cells.clear();
+  openmc::model::n_coord_levels = old_levels;
 }
 
 TEST_CASE("Universe AABB candidates retain original cell order")

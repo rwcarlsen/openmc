@@ -421,8 +421,11 @@ void cross_lattice(GeometryState& p, const BoundaryInfo& boundary, bool verbose)
 BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
 {
   BoundaryInfo info;
-  // Loop over each coordinate level.
-  for (int i = 0; i < p.n_coord(); i++) {
+  // Search from the innermost coordinate outward. The nearest lower-level
+  // boundary limits how much of each enclosing CSG expression can be reached.
+  // This is especially valuable when a local cell clips a parent containing
+  // large unions of disjoint features.
+  for (int i = p.n_coord() - 1; i >= 0; --i) {
     const auto& coord {p.coord(i)};
     const Position& r {coord.r()};
     const Direction& u {coord.u()};
@@ -463,9 +466,17 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
 
     // The particle is already known to be in each cell in its coordinate
     // stack. Neither a surface beyond the lattice crossing nor one beyond a
-    // boundary found at a higher level can affect the result.
+    // boundary already found at a lower level can affect the result.
+    double enclosing_limit = info.distance();
+    if (enclosing_limit < INFINITY) {
+      // A coincident boundary at a higher coordinate level takes precedence.
+      // Leave enough room to discover it despite roundoff, matching the
+      // top-down tie behavior used before lower-level clipping was introduced.
+      enclosing_limit += std::max(
+        FP_COINCIDENT, FP_REL_PRECISION * std::abs(enclosing_limit));
+    }
     const double distance_limit =
-      std::min({info.distance(), d_lat, max_distance});
+      std::min({enclosing_limit, d_lat, max_distance});
     auto [d_surf, level_surf_cross] =
       c.distance(r, u, p.surface(), &p, true, distance_limit);
 
@@ -474,7 +485,9 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
     // is selected.  This logic must consider floating point precision.
     double& d = info.distance();
     if (d_surf < d_lat - FP_COINCIDENT) {
-      if (d == INFINITY || (d - d_surf) / d >= FP_REL_PRECISION) {
+      const double tolerance = std::max(
+        FP_COINCIDENT, FP_REL_PRECISION * std::abs(d));
+      if (d == INFINITY || d_surf <= d + tolerance) {
         // Update closest distance
         d = d_surf;
 
@@ -487,7 +500,9 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
         info.coord_level() = i + 1;
       }
     } else {
-      if (d == INFINITY || (d - d_lat) / d >= FP_REL_PRECISION) {
+      const double tolerance = std::max(
+        FP_COINCIDENT, FP_REL_PRECISION * std::abs(d));
+      if (d == INFINITY || d_lat <= d + tolerance) {
         d = d_lat;
         info.surface() = SURFACE_NONE;
         info.lattice_translation() = level_lat_trans;
