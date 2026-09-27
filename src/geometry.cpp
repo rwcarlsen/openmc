@@ -421,17 +421,51 @@ void cross_lattice(GeometryState& p, const BoundaryInfo& boundary, bool verbose)
 BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
 {
   BoundaryInfo info;
-  // Search from the innermost coordinate outward. The nearest lower-level
-  // boundary limits how much of each enclosing CSG expression can be reached.
-  // This is especially valuable when a local cell clips a parent containing
-  // large unions of disjoint features.
-  for (int i = p.n_coord() - 1; i >= 0; --i) {
+  if (p.n_coord() == 1) {
+    const auto& coord {p.coord(0)};
+    const Position& r {coord.r()};
+    const Direction& u {coord.u()};
+    Cell& cell {*model::cells[coord.cell()]};
+    auto [distance, surface] =
+      cell.distance(r, u, p.surface(), &p, true, max_distance);
+    if (distance < max_distance) {
+      info.distance() = distance;
+      info.surface() = surface;
+      info.coord_level() = 1;
+    }
+    return info;
+  }
+
+  struct LevelBoundary {
+    int level;
+    std::size_t cost;
+    double lattice_distance {INFINITY};
+    array<int, 3> lattice_translation {};
+  };
+  static thread_local vector<LevelBoundary> levels;
+  levels.clear();
+  levels.reserve(p.n_coord());
+
+  auto can_replace = [&](double candidate, int level) {
+    const double distance = info.distance();
+    if (distance == INFINITY)
+      return true;
+    const double tolerance = std::max(
+      FP_COINCIDENT, FP_REL_PRECISION * std::abs(distance));
+    if (candidate < distance - tolerance)
+      return true;
+    return candidate <= distance + tolerance &&
+           level + 1 < info.coord_level();
+  };
+
+  // Lattice distances are inexpensive and can cap all subsequent cell work.
+  for (int i = 0; i < p.n_coord(); ++i) {
     const auto& coord {p.coord(i)};
     const Position& r {coord.r()};
     const Direction& u {coord.u()};
     Cell& c {*model::cells[coord.cell()]};
-    double d_lat = INFINITY;
-    array<int, 3> level_lat_trans {};
+    levels.push_back({i, c.boundary_search_cost()});
+    auto& level = levels.back();
 
     // Find the distance to the next lattice tile crossing.
     if (coord.lattice() != C_NONE) {
@@ -454,19 +488,52 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
         lattice_distance = lat.distance(r_hex, u, coord.lattice_index());
         break;
       }
-      d_lat = lattice_distance.first;
-      level_lat_trans = lattice_distance.second;
+      level.lattice_distance = lattice_distance.first;
+      level.lattice_translation = lattice_distance.second;
 
-      if (d_lat < 0) {
+      if (level.lattice_distance < 0) {
         p.mark_as_lost(fmt::format("Particle {} had a negative distance "
                                    "to a lattice boundary.",
           p.id()));
       }
+
+      if (level.lattice_distance < max_distance &&
+          can_replace(level.lattice_distance, i)) {
+        info.distance() = level.lattice_distance;
+        info.surface() = SURFACE_NONE;
+        info.lattice_translation() = level.lattice_translation;
+        info.coord_level() = i + 1;
+      }
     }
+  }
+
+  // Cheap regions establish reachability limits before expensive Boolean
+  // expressions. Prefer deeper cells when costs tie because local cells tend
+  // to provide the tightest clipping boundary.
+  auto less_cost = [](const auto& a, const auto& b) {
+    return a.cost < b.cost || (a.cost == b.cost && a.level > b.level);
+  };
+  for (std::size_t i = 1; i < levels.size(); ++i) {
+    const LevelBoundary value = levels[i];
+    std::size_t j = i;
+    while (j > 0 && less_cost(value, levels[j - 1])) {
+      levels[j] = levels[j - 1];
+      --j;
+    }
+    levels[j] = value;
+  }
+
+  for (const auto& level : levels) {
+    const int i = level.level;
+    const auto& coord {p.coord(i)};
+    const Position& r {coord.r()};
+    const Direction& u {coord.u()};
+    Cell& c {*model::cells[coord.cell()]};
+    const double d_lat = level.lattice_distance;
 
     // The particle is already known to be in each cell in its coordinate
-    // stack. Neither a surface beyond the lattice crossing nor one beyond a
-    // boundary already found at a lower level can affect the result.
+    // stack. Neither a surface beyond the lattice crossing nor one beyond an
+    // already discovered boundary can affect the result.
     double enclosing_limit = info.distance();
     if (enclosing_limit < INFINITY) {
       // A coincident boundary at a higher coordinate level takes precedence.
@@ -485,9 +552,7 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
     // is selected.  This logic must consider floating point precision.
     double& d = info.distance();
     if (d_surf < d_lat - FP_COINCIDENT) {
-      const double tolerance = std::max(
-        FP_COINCIDENT, FP_REL_PRECISION * std::abs(d));
-      if (d == INFINITY || d_surf <= d + tolerance) {
+      if (can_replace(d_surf, i)) {
         // Update closest distance
         d = d_surf;
 
@@ -497,15 +562,6 @@ BoundaryInfo distance_to_boundary(GeometryState& p, double max_distance)
         info.lattice_translation()[0] = 0;
         info.lattice_translation()[1] = 0;
         info.lattice_translation()[2] = 0;
-        info.coord_level() = i + 1;
-      }
-    } else {
-      const double tolerance = std::max(
-        FP_COINCIDENT, FP_REL_PRECISION * std::abs(d));
-      if (d == INFINITY || d_lat <= d + tolerance) {
-        d = d_lat;
-        info.surface() = SURFACE_NONE;
-        info.lattice_translation() = level_lat_trans;
         info.coord_level() = i + 1;
       }
     }

@@ -224,8 +224,8 @@ private:
 class LimitedDistanceCell : public openmc::Cell {
 public:
   LimitedDistanceCell(int id, double boundary, openmc::vector<int>& calls,
-    openmc::vector<double>& limits)
-    : boundary_ {boundary}, calls_ {calls}, limits_ {limits}
+    openmc::vector<double>& limits, std::size_t cost = 1)
+    : boundary_ {boundary}, cost_ {cost}, calls_ {calls}, limits_ {limits}
   {
     id_ = id;
     fill_ = openmc::C_NONE;
@@ -257,9 +257,11 @@ public:
   {
     return openmc::GeometryType::CSG;
   }
+  std::size_t boundary_search_cost() const override { return cost_; }
 
 private:
   double boundary_;
+  std::size_t cost_;
   openmc::vector<int>& calls_;
   openmc::vector<double>& limits_;
 };
@@ -367,7 +369,7 @@ TEST_CASE("Inner boundaries clip enclosing region searches")
   openmc::vector<double> limits;
   openmc::model::cells.clear();
   openmc::model::cells.push_back(
-    std::make_unique<LimitedDistanceCell>(10, 10.0, calls, limits));
+    std::make_unique<LimitedDistanceCell>(10, 10.0, calls, limits, 100));
   openmc::model::cells.push_back(
     std::make_unique<LimitedDistanceCell>(20, 1.0, calls, limits));
 
@@ -380,6 +382,35 @@ TEST_CASE("Inner boundaries clip enclosing region searches")
   REQUIRE(boundary.distance() == 1.0);
   REQUIRE(boundary.coord_level() == 2);
   REQUIRE(calls == openmc::vector<int> {20, 10});
+  REQUIRE(limits[0] == openmc::INFTY);
+  REQUIRE(limits[1] > 1.0);
+  REQUIRE(limits[1] < 1.001);
+
+  openmc::model::cells.clear();
+  openmc::model::n_coord_levels = old_levels;
+}
+
+TEST_CASE("Cheap enclosing boundaries clip expensive inner searches")
+{
+  const int old_levels = openmc::model::n_coord_levels;
+  openmc::model::n_coord_levels = 2;
+  openmc::vector<int> calls;
+  openmc::vector<double> limits;
+  openmc::model::cells.clear();
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(10, 1.0, calls, limits));
+  openmc::model::cells.push_back(
+    std::make_unique<LimitedDistanceCell>(20, 10.0, calls, limits, 100));
+
+  openmc::GeometryState p;
+  p.n_coord() = 2;
+  p.coord(0).cell() = 0;
+  p.coord(1).cell() = 1;
+  const auto boundary = openmc::distance_to_boundary(p);
+
+  REQUIRE(boundary.distance() == 1.0);
+  REQUIRE(boundary.coord_level() == 1);
+  REQUIRE(calls == openmc::vector<int> {10, 20});
   REQUIRE(limits[0] == openmc::INFTY);
   REQUIRE(limits[1] > 1.0);
   REQUIRE(limits[1] < 1.001);

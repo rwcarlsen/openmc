@@ -1,6 +1,7 @@
 #ifndef OPENMC_CELL_H
 #define OPENMC_CELL_H
 
+#include <cstddef>
 #include <cstdint>
 #include <functional> // for hash
 #include <limits>
@@ -103,6 +104,12 @@ public:
 
   //! Get Boolean of if the cell is simple or not
   bool is_simple() const { return simple_; }
+
+  //! Relative cost of boundary surfaces and Boolean evaluation.
+  std::size_t boundary_search_cost() const
+  {
+    return surface_tokens_.size() + boolean_nodes_.size();
+  }
 
 private:
   //----------------------------------------------------------------------------
@@ -348,6 +355,9 @@ public:
   //! Check if the cell region expression is simple
   virtual bool is_simple() const { return true; }
 
+  //! Relative cost of finding this cell's next boundary.
+  virtual std::size_t boundary_search_cost() const { return 1; }
+
   //----------------------------------------------------------------------------
   // Accessors
 
@@ -557,6 +567,11 @@ public:
   void to_hdf5_inner(hid_t group_id) const override;
 
   bool is_simple() const override { return region_.is_simple(); }
+
+  std::size_t boundary_search_cost() const override
+  {
+    return region_.boundary_search_cost();
+  }
 
   virtual GeometryType geom_type() const override { return GeometryType::CSG; }
 
