@@ -123,6 +123,9 @@ public:
   //! Add a score to the current realization.
   void add_score(int64_t filter_index, int score_index, double score);
 
+  //! Add a transport score, buffering updates to large tallies.
+  void add_score_buffered(int64_t filter_index, int score_index, double score);
+
   //! Fold thread-private scores into the public VALUE result column.
   void reduce_thread_results();
 
@@ -202,6 +205,10 @@ private:
 
   //! Per-thread VALUE storage used for small, dense tallies.
   tensor::Tensor<double> private_results_;
+
+  //! Bounded per-thread cache used to combine scores for large tallies.
+  vector<int64_t> score_cache_indices_;
+  vector<double> score_cache_values_;
 
   int64_t index_;
 };

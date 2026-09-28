@@ -127,4 +127,12 @@ TEST_CASE("Large dense tallies retain atomic accumulation")
     tally->add_score(0, 0, 1.0);
   }
   REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == n_scores);
+
+#pragma omp parallel for
+  for (int i = 0; i < n_scores; ++i) {
+    tally->add_score_buffered(0, 0, 1.0);
+  }
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == n_scores);
+  tally->reduce_thread_results();
+  REQUIRE(tally->results()(0, 0, TallyResult::VALUE) == 2 * n_scores);
 }

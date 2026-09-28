@@ -50,10 +50,11 @@ namespace openmc {
 
 namespace {
 
-// Keep private storage bounded both by tally size and by total bytes per tally.
-// Tallies outside either limit retain the atomic scoring path.
+// Keep full private storage bounded by tally size and total bytes per tally.
+// Larger tallies use a small per-thread cache before falling back to atomics.
 constexpr size_t MAX_PRIVATE_TALLY_ELEMENTS = 4'096;
 constexpr size_t MAX_PRIVATE_TALLY_BYTES = 64 * 1024 * 1024;
+constexpr size_t TALLY_SCORE_CACHE_SIZE = 1024;
 
 } // namespace
 
@@ -867,6 +868,13 @@ void Tally::init_results()
       {n_threads, static_cast<size_t>(n_filter_bins_),
         static_cast<size_t>(n_scores)});
   }
+  score_cache_indices_ = {};
+  score_cache_values_ = {};
+  if (settings::solver_type == SolverType::MONTE_CARLO &&
+      private_results_.size() == 0 && n_threads > 0) {
+    score_cache_indices_.assign(n_threads * TALLY_SCORE_CACHE_SIZE, -1);
+    score_cache_values_.resize(n_threads * TALLY_SCORE_CACHE_SIZE);
+  }
 }
 
 void Tally::reset()
@@ -878,6 +886,8 @@ void Tally::reset()
   if (private_results_.size() != 0) {
     private_results_.fill(0.0);
   }
+  std::fill(score_cache_indices_.begin(), score_cache_indices_.end(), -1);
+  std::fill(score_cache_values_.begin(), score_cache_values_.end(), 0.0);
 }
 
 void Tally::add_score(int64_t filter_index, int score_index, double score)
@@ -892,10 +902,58 @@ void Tally::add_score(int64_t filter_index, int score_index, double score)
   }
 }
 
+void Tally::add_score_buffered(
+  int64_t filter_index, int score_index, double score)
+{
+  int i_thread = thread_num();
+  if (private_results_.size() != 0 &&
+      static_cast<size_t>(i_thread) < private_results_.shape(0)) {
+    private_results_(i_thread, filter_index, score_index) += score;
+  } else if (i_thread >= 0 &&
+             static_cast<size_t>(i_thread) <
+               score_cache_indices_.size() / TALLY_SCORE_CACHE_SIZE) {
+    const int64_t score_offset =
+      filter_index * results_.shape(1) + score_index;
+    const size_t slot = static_cast<uint64_t>(score_offset) *
+                        UINT64_C(11400714819323198485) >>
+                        54;
+    const size_t cache_offset =
+      i_thread * TALLY_SCORE_CACHE_SIZE + slot;
+    const int64_t old_offset = score_cache_indices_[cache_offset];
+    if (old_offset == score_offset) {
+      score_cache_values_[cache_offset] += score;
+      return;
+    }
+    if (old_offset >= 0) {
+#pragma omp atomic
+      results_.data()[old_offset * results_.shape(2)] +=
+        score_cache_values_[cache_offset];
+    }
+    score_cache_indices_[cache_offset] = score_offset;
+    score_cache_values_[cache_offset] = score;
+  } else {
+#pragma omp atomic
+    results_(filter_index, score_index, TallyResult::VALUE) += score;
+  }
+}
+
 void Tally::reduce_thread_results()
 {
-  if (private_results_.size() == 0)
+  if (private_results_.size() == 0 && score_cache_indices_.empty())
     return;
+
+  if (!score_cache_indices_.empty()) {
+    for (size_t i = 0; i < score_cache_indices_.size(); ++i) {
+      const int64_t score_offset = score_cache_indices_[i];
+      if (score_offset >= 0) {
+        results_.data()[score_offset * results_.shape(2)] +=
+          score_cache_values_[i];
+        score_cache_indices_[i] = -1;
+        score_cache_values_[i] = 0.0;
+      }
+    }
+    return;
+  }
 
 #pragma omp parallel for
   for (int64_t i = 0; i < results_.shape(0); ++i) {
